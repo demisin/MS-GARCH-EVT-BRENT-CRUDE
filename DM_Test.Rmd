@@ -1,0 +1,109 @@
+---
+title: "DM Test"
+author: "Demi Gray"
+date: "2026-08-13"
+output: html_document
+---
+
+```{r setup-dm, message=FALSE}
+sm <- readRDS("shortmemory_dm_input.rds")
+lm <- readRDS("longmemory_dm_input.rds")
+ms <- readRDS("msgarch_dm_input.rds")
+```
+
+```{r dm-test-function}
+# Tick (lin-lin) loss function, per methodology Section 3.6.4
+tick_loss <- function(realized, VaR, q) {
+  (realized - VaR) * (q - as.numeric(realized < VaR))
+}
+
+# Diebold-Mariano test on VaR forecasts, HAC-adjusted (Newey-West)
+dm_test_var <- function(realized, VaR_i, VaR_j, q) {
+  Li <- tick_loss(realized, VaR_i, q)
+  Lj <- tick_loss(realized, VaR_j, q)
+  d  <- Li - Lj
+
+  n <- length(d)
+  dbar <- mean(d)
+
+  acf_d <- acf(d, plot = FALSE, lag.max = n - 1)$acf[-1]
+  gamma0 <- var(d)
+  lags <- floor(4 * (n / 100)^(2 / 9))
+  nw_var <- gamma0
+  for (k in 1:min(lags, length(acf_d))) {
+    w <- 1 - k / (lags + 1)
+    nw_var <- nw_var + 2 * w * acf_d[k] * gamma0
+  }
+  se <- sqrt(nw_var / n)
+
+  DM <- dbar / se
+  p_value <- 2 * pnorm(-abs(DM))
+
+  data.frame(
+    DM_stat = round(DM, 4),
+    p_value = round(p_value, 4),
+    mean_loss_diff = round(dbar, 6)
+  )
+}
+```
+
+```{r align-by-date}
+align_three <- function(sm_series, lm_series, ms_series) {
+  common_dates <- Reduce(intersect, list(
+    as.character(sm_series$Date),
+    as.character(lm_series$Date),
+    as.character(ms_series$Date)
+  ))
+  common_dates <- as.Date(common_dates)
+
+  idx_sm <- match(common_dates, as.Date(sm_series$Date))
+  idx_lm <- match(common_dates, as.Date(lm_series$Date))
+  idx_ms <- match(common_dates, as.Date(ms_series$Date))
+
+  list(
+    dates    = common_dates,
+    realized = sm_series$realized[idx_sm],
+    VaR_L_sm = sm_series$VaR_L[idx_sm], VaR_R_sm = sm_series$VaR_R[idx_sm],
+    VaR_L_lm = lm_series$VaR_L[idx_lm], VaR_R_lm = lm_series$VaR_R[idx_lm],
+    VaR_L_ms = ms_series$VaR_L[idx_ms], VaR_R_ms = ms_series$VaR_R[idx_ms]
+  )
+}
+
+wti_aligned   <- align_three(sm$wti, lm$wti, ms$wti)
+brent_aligned <- align_three(sm$brent, lm$brent, ms$brent)
+
+cat("WTI aligned observations:", length(wti_aligned$dates), "\n")
+cat("Brent aligned observations:", length(brent_aligned$dates), "\n")
+
+cat("WTI realized-return cross-check (should be ~0):",
+    max(abs(sm$wti$realized[match(wti_aligned$dates, as.Date(sm$wti$Date))] -
+            lm$wti$realized[match(wti_aligned$dates, as.Date(lm$wti$Date))])), "\n")
+```
+
+```{r run-pairwise-dm}
+q_left  <- 0.01
+q_right <- 0.99
+
+run_all_pairs <- function(aligned) {
+  pairs <- list(
+    "Short vs Long (Left)"     = dm_test_var(aligned$realized, aligned$VaR_L_sm, aligned$VaR_L_lm, q_left),
+    "Short vs MSGARCH (Left)"  = dm_test_var(aligned$realized, aligned$VaR_L_sm, aligned$VaR_L_ms, q_left),
+    "Long vs MSGARCH (Left)"   = dm_test_var(aligned$realized, aligned$VaR_L_lm, aligned$VaR_L_ms, q_left),
+    "Short vs Long (Right)"    = dm_test_var(aligned$realized, aligned$VaR_R_sm, aligned$VaR_R_lm, q_right),
+    "Short vs MSGARCH (Right)" = dm_test_var(aligned$realized, aligned$VaR_R_sm, aligned$VaR_R_ms, q_right),
+    "Long vs MSGARCH (Right)"  = dm_test_var(aligned$realized, aligned$VaR_R_lm, aligned$VaR_R_ms, q_right)
+  )
+  do.call(rbind, Map(function(nm, res) cbind(Comparison = nm, res), names(pairs), pairs))
+}
+
+dm_wti   <- run_all_pairs(wti_aligned)
+dm_brent <- run_all_pairs(brent_aligned)
+
+cat("=== WTI DM Results ===\n")
+print(dm_wti, row.names = FALSE)
+
+cat("\n=== Brent DM Results ===\n")
+print(dm_brent, row.names = FALSE)
+
+saveRDS(list(wti = dm_wti, brent = dm_brent), "dm_test_results.rds")
+```
