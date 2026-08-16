@@ -1,0 +1,735 @@
+---
+title: "Msc Financial Risk Management Diss - Long Memory GARCH (FIGARCH/FIAPARCH) Master"
+author: "Demi Gray"
+date: "2026-08-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4)
+```
+
+## 1. Packages
+
+```{r package-imports, message=FALSE, warning=FALSE}
+library(quantmod)
+library(xts)
+library(zoo)
+library(dplyr)
+library(ggplot2)
+library(fEGarch)
+library(evir)
+library(POT)
+library(esback)
+library(moments)
+library(tseries)
+library(urca)
+```
+
+## 2. CSV Import & Log Return Construction
+
+```{r data-import}
+wti_raw   <- read.csv("WTI SPOT CSV.csv",   skip = 5, header = TRUE)
+brent_raw <- read.csv("BRENT SPOT CSV.csv", skip = 5, header = TRUE)
+
+colnames(wti_raw)   <- c("Date", "Price")
+colnames(brent_raw) <- c("Date", "Price")
+
+wti_raw$Date   <- as.Date(wti_raw$Date,   format = "%m/%d/%Y")
+brent_raw$Date <- as.Date(brent_raw$Date, format = "%m/%d/%Y")
+
+wti_raw   <- wti_raw[!is.na(wti_raw$Date)   & !is.na(wti_raw$Price), ]
+brent_raw <- brent_raw[!is.na(brent_raw$Date) & !is.na(brent_raw$Price), ]
+
+wti_raw   <- wti_raw[order(wti_raw$Date), ]
+brent_raw <- brent_raw[order(brent_raw$Date), ]
+
+wti_xts   <- xts(wti_raw$Price,   order.by = wti_raw$Date)
+brent_xts <- xts(brent_raw$Price, order.by = brent_raw$Date)
+colnames(wti_xts) <- "Price"; colnames(brent_xts) <- "Price"
+```
+
+```{r trim-and-clean}
+start_date <- as.Date("2010-01-01")
+end_date   <- as.Date("2025-12-31")
+
+wti_xts   <- wti_xts[paste(start_date, end_date, sep = "/")]
+brent_xts <- brent_xts[paste(start_date, end_date, sep = "/")]
+
+# Exclude the 20 April 2020 negative WTI price (log-return undefined for P <= 0)
+wti_xts <- wti_xts[index(wti_xts) != as.Date("2020-04-20"), ]
+```
+
+```{r construct-returns}
+wti_ret   <- 100 * diff(log(wti_xts))
+brent_ret <- 100 * diff(log(brent_xts))
+wti_ret   <- na.omit(wti_ret)
+brent_ret <- na.omit(brent_ret)
+
+# Exclude the contaminated 21 April 2020 return (downstream of the excluded 20 April price)
+wti_ret <- wti_ret[index(wti_ret) != as.Date("2020-04-21"), ]
+
+cat("WTI observations:",   nrow(wti_ret),   "\n")
+cat("Brent observations:", nrow(brent_ret), "\n")
+```
+
+## 3. Preliminary Analysis
+
+Identical to the short-memory suite, since these results depend only on
+the return series itself, not on the choice of GARCH specification. The
+full preliminary battery (stationarity, visual inspection, mean-equation
+specification check, zero-mean t-test) is conducted once in the
+short-memory master file; its conclusions are carried forward here.
+
+```{r descriptive-stats}
+desc_stats <- function(x, name) {
+  x <- as.numeric(x)
+  jb <- jarque.bera.test(x)
+  data.frame(Series = name, Mean = mean(x), SD = sd(x),
+             Skewness = skewness(x), ExcKurt = kurtosis(x) - 3,
+             Min = min(x), Max = max(x),
+             JB_stat = unname(jb$statistic), JB_pvalue = jb$p.value)
+}
+rbind(desc_stats(wti_ret, "WTI"), desc_stats(brent_ret, "Brent"))
+```
+
+```{r ljung-box-prelim}
+lb_row <- function(x, lag, name) {
+  x <- as.numeric(x)
+  raw <- Box.test(x, lag = lag, type = "Ljung-Box")
+  sq  <- Box.test(x^2, lag = lag, type = "Ljung-Box")
+  data.frame(Series = name, Lag = lag, LB_raw_p = raw$p.value, LB_sq_p = sq$p.value)
+}
+lags <- c(5, 10, 20)
+do.call(rbind, c(lapply(lags, lb_row, x = wti_ret, name = "WTI"),
+                lapply(lags, lb_row, x = brent_ret, name = "Brent")))
+```
+
+Conclusion carried forward from the short-memory suite: a zero-mean
+specification is adequate for both series (Ljung-Box p = 0.76 WTI,
+p = 0.30 Brent at lag 10 on standardised residuals; AR(1) inclusion did
+not materially improve fit). Zero-mean is enforced throughout below via
+`mean_spec(orders = c(0,0), include_mean = FALSE)`.
+
+## 4. Model Estimation: FIGARCH & FIAPARCH (Norm + Student-t, Zero-Mean)
+
+The 8-model configuration list defined here drives everything
+downstream (gate, EVT, rolling), so a model is specified in exactly one
+place.
+
+```{r figarch-fiaparch-fit}
+zero_mean <- mean_spec(orders = c(0, 0), include_mean = FALSE)
+
+# Master configuration: name -> return series, fitting function, distribution
+lm_configs <- list(
+  WTI_FIGARCH_norm    = list(ret = wti_ret,   fun = figarch,  dist = "norm"),
+  WTI_FIGARCH_std     = list(ret = wti_ret,   fun = figarch,  dist = "std"),
+  WTI_FIAPARCH_norm   = list(ret = wti_ret,   fun = fiaparch, dist = "norm"),
+  WTI_FIAPARCH_std    = list(ret = wti_ret,   fun = fiaparch, dist = "std"),
+  Brent_FIGARCH_norm  = list(ret = brent_ret, fun = figarch,  dist = "norm"),
+  Brent_FIGARCH_std   = list(ret = brent_ret, fun = figarch,  dist = "std"),
+  Brent_FIAPARCH_norm = list(ret = brent_ret, fun = fiaparch, dist = "norm"),
+  Brent_FIAPARCH_std  = list(ret = brent_ret, fun = fiaparch, dist = "std")
+)
+
+lm_models <- lapply(lm_configs, function(cfg) {
+  cfg$fun(as.numeric(cfg$ret), orders = c(1, 1), cond_dist = cfg$dist,
+          meanspec = zero_mean)
+})
+```
+
+```{r inspect-all-fits}
+for (nm in names(lm_models)) {
+  cat("\n===", nm, "===\n")
+  print(lm_models[[nm]])
+}
+```
+
+### 4.1 Convergence / Estimation Sanity Check
+
+Mirrors the short-memory suite's convergence check (Section 5.1b there).
+fEGarch does not expose a `convergence()` flag like rugarch, so the
+check is on the estimation output itself: the log-likelihood must be
+finite and no coefficient standard error may be NA/NaN (a failed or
+degenerate Rsolnp solution typically produces a non-invertible Hessian
+and hence NA standard errors). The fEGarch authors' own simulation study
+(Schulz et al. 2026, Table 6) reports convergence issues arising
+specifically for long-memory specifications, which motivates checking
+explicitly here.
+
+```{r convergence-check-lm}
+conv_check_lm <- function(fit, name) {
+  ll  <- tryCatch(as.numeric(fit@llhood), error = function(e) NA_real_)
+  ses <- tryCatch(fit@se, error = function(e) NA_real_)
+  data.frame(Model = name,
+             LogLik_finite = is.finite(ll),
+             All_SE_valid  = all(is.finite(ses)),
+             OK = is.finite(ll) && all(is.finite(ses)))
+}
+conv_table_lm <- do.call(rbind, Map(conv_check_lm, lm_models, names(lm_models)))
+conv_table_lm
+
+if (!all(conv_table_lm$OK)) {
+  cat("WARNING: the following fits show signs of estimation failure and",
+      "should be investigated before proceeding:\n")
+  print(conv_table_lm[!conv_table_lm$OK, ])
+} else {
+  cat("All 8 fits show finite log-likelihoods and valid standard errors.\n")
+}
+```
+
+### 4.2 Residual-Type Sanity Check
+
+The diagnostic gate and the entire EVT layer operate on standardised
+residuals (eta_t = r_t / sigma_t). This one-off check confirms
+`residuals()` on an fEGarch fit returns the standardised series (@etat)
+rather than raw residuals, so nothing downstream is silently fitted to
+the wrong series.
+
+```{r residual-sanity-lm}
+f_chk <- lm_models[[1]]
+chk1 <- isTRUE(all.equal(as.numeric(residuals(f_chk)), as.numeric(f_chk@etat)))
+chk2 <- isTRUE(all.equal(as.numeric(residuals(f_chk)),
+                         as.numeric(f_chk@rt) / as.numeric(sigt(f_chk))))
+cat("residuals() == @etat:", chk1, "\n")
+cat("residuals() == rt/sigt:", chk2, "\n")
+if (!chk1 && !chk2) stop("residuals() does not return standardised residuals - use fit@etat downstream instead.")
+```
+
+### 4.3 Non-Negativity Diagnostic (Baillie et al. 1996)
+
+Fitted parameters do not satisfy the Baillie, Bollerslev & Mikkelsen
+(1996) sufficient (not necessary) restriction phi <= d <= 1-beta for
+guaranteed non-negative conditional variance. Since this condition is
+sufficient rather than necessary, the true (and considerably more
+complex) region of parameter space guaranteeing non-negativity is larger
+than this convenient box constraint -- a fitted model can therefore lie
+outside the box while still never producing a negative variance. This is
+checked directly below via the fitted conditional variance path itself,
+rather than relying on the simplified sufficient condition alone.
+
+```{r negativity-check}
+check_negativity <- function(fit, name) {
+  sig <- tryCatch(sigt(fit), error = function(e) NULL)
+  if (is.null(sig)) return(data.frame(Model = name, N_negative = NA, Min_value = NA))
+  data.frame(Model = name, N_negative = sum(sig < 0), Min_value = round(min(sig), 6))
+}
+do.call(rbind, Map(check_negativity, lm_models, names(lm_models)))
+```
+
+Direct inspection confirms conditional variance stayed strictly positive
+throughout the full sample for all 8 models, despite the sufficient
+condition not being met.
+
+## 5. Diagnostic Gate
+
+Same explicit pass/fail rule as the short-memory suite: standardised
+residuals must show no significant autocorrelation (Ljung-Box, raw and
+squared, p > 0.05 at lag 10). All models passing are carried forward to
+EVT, the rolling engine, and backtesting -- the number of survivors is
+determined by the data, not fixed in advance.
+
+```{r diagnostic-gate-lm}
+diag_check_lm <- function(fit, name) {
+  z <- as.numeric(residuals(fit))
+  lb_raw <- Box.test(z,   lag = 10, type = "Ljung-Box")
+  lb_sq  <- Box.test(z^2, lag = 10, type = "Ljung-Box")
+  data.frame(Model = name, LB_raw_p = round(lb_raw$p.value, 4), LB_sq_p = round(lb_sq$p.value, 4))
+}
+
+lm_diag_table <- do.call(rbind, Map(diag_check_lm, lm_models, names(lm_models)))
+lm_diag_table
+
+gate_pass_lm <- lm_diag_table$Model[lm_diag_table$LB_raw_p > 0.05 & lm_diag_table$LB_sq_p > 0.05]
+cat("\nModels passing the diagnostic gate:\n"); print(gate_pass_lm)
+
+lm_models_survivors  <- lm_models[gate_pass_lm]
+lm_configs_survivors <- lm_configs[gate_pass_lm]
+```
+
+## 6. Model Selection (AIC/BIC)
+
+Selection here names the primary specification for headline discussion
+only; all diagnostically adequate models are retained through rolling
+backtesting, with model discrimination left to out-of-sample
+performance (consistent with the short-memory suite).
+
+```{r ic-table-lm}
+# fEGarch objects are S4 and do not carry logLik()/AIC()/BIC() methods.
+# Per Schulz et al. (2026): @llhood is the (unnormalised) log-likelihood,
+# @inf_criteria holds the normalised AIC and BIC (AIC/n, BIC/n). n is
+# identical within each series, so model rankings are unaffected.
+ic_row_lm <- function(fit, name) {
+  ic <- fit@inf_criteria
+  data.frame(Model = name,
+             LogLik = round(as.numeric(fit@llhood), 2),
+             AIC_n  = round(unname(ic[1]), 4),
+             BIC_n  = round(unname(ic[2]), 4))
+}
+do.call(rbind, Map(ic_row_lm, lm_models, names(lm_models)))
+```
+
+FIAPARCH-std is the primary specification for both series (lowest
+AIC/BIC among survivors), consistent with Aloui & Mabrouk (2010).
+FIGARCH consistently estimates d near the unit-root boundary
+(0.95-1.00); FIAPARCH gives more moderate d (~0.53-0.58) once
+asymmetry/power flexibility is added.
+
+### 6.1 Fractional Differencing & Distribution Shape Parameters
+
+Mirrors the short-memory suite's degrees-of-freedom table (5.3b there),
+extended with the long-memory parameter d. Extraction is by name pattern
+with the full coefficient vector printed once, so a naming mismatch is
+visible rather than silently returning NA.
+
+```{r param-table-lm}
+cat("Coefficient names (first model):",
+    paste(names(lm_models[[1]]@pars), collapse = ", "), "\n\n")
+
+param_row_lm <- function(fit, name) {
+  cf <- fit@pars; se <- tryCatch(fit@se, error = function(e) rep(NA, length(cf)))
+  pick <- function(pat) {
+    i <- grep(pat, names(cf))
+    if (length(i) == 0) c(NA, NA) else c(unname(cf[i[1]]), unname(se[i[1]]))
+  }
+  d_v  <- pick("^d$")
+  sh_v <- pick("^df$")
+  data.frame(Model = name,
+             d = round(d_v[1], 4), d_SE = round(d_v[2], 4),
+             Shape = round(sh_v[1], 4), Shape_SE = round(sh_v[2], 4))
+}
+do.call(rbind, Map(param_row_lm, lm_models, names(lm_models)))
+```
+
+### 6.2 In-Sample Forecast Evaluation (MSE, MAE, QLIKE)
+
+Mirrors the short-memory suite's in-sample evaluation (5.4 there):
+fitted conditional variance against squared returns over the full
+sample, complementing the out-of-sample metrics in Section 13.
+
+```{r insample-accuracy-lm}
+insample_accuracy_lm <- function(fit, cfg, name) {
+  realized_var <- as.numeric(cfg$ret)^2
+  fitted_var   <- as.numeric(sigt(fit))^2
+  data.frame(Model = name,
+             MSE  = round(mean((realized_var - fitted_var)^2, na.rm = TRUE), 4),
+             MAE  = round(mean(abs(realized_var - fitted_var), na.rm = TRUE), 4),
+             QLIKE = round(mean(log(fitted_var) + realized_var / fitted_var, na.rm = TRUE), 4))
+}
+do.call(rbind, Map(insample_accuracy_lm, lm_models, lm_configs, names(lm_models)))
+```
+
+## 7. News Impact Surface (FIAPARCH Models)
+
+# --- News Impact Surface for FIAPARCH models ---
+# FIAPARCH's long-memory structure means the true "impact" of a single
+# shock formally depends on an infinite ARCH(∞) representation via the
+# fractional-differencing filter. Following standard practice (e.g. Tse
+# 1998), this is approximated by truncating that representation and
+# examining the leading-order response: how conditional variance reacts
+# to today's shock, holding the lagged variance term at fixed multiples
+# of the unconditional variance (mirroring the MS-GARCH NIS construction).
+```{r NIC}
+fiaparch_nis <- function(fit, z_range = seq(-4, 4, length.out = 60),
+                          lagvar_mult = seq(0.5, 2.5, length.out = 40)) {
+  pars <- fit@pars
+  omega <- pars["omega"]
+  beta1 <- pars["beta1"]
+  gamma <- pars["gamma"]
+  delta <- pars["delta"]
+
+  uncond_var <- (omega / (1 - beta1))^(2/delta)  # approx unconditional variance scale
+
+  grid <- expand.grid(z = z_range, lagvar_ratio = lagvar_mult)
+
+  grid$sigma_lag_delta <- (uncond_var * grid$lagvar_ratio)^(delta/2)
+
+  # Asymmetric power transformation (APARCH-style): (|z| - gamma*z)^delta
+  grid$shock_term <- (abs(grid$z) - gamma * grid$z)^delta
+
+  # Leading-order approximation: variance response combines the shock
+  # term with the persisted lagged-variance term, scaled by omega
+  grid$cond_var <- (omega + grid$shock_term + beta1 * grid$sigma_lag_delta)^(2/delta)
+
+  grid
+}
+
+nis_wti_fiaparch   <- fiaparch_nis(lm_models[["WTI_FIAPARCH_std"]])
+nis_brent_fiaparch <- fiaparch_nis(lm_models[["Brent_FIAPARCH_std"]])
+
+library(ggplot2)
+ggplot(nis_wti_fiaparch, aes(x = z, y = lagvar_ratio, fill = cond_var)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Conditional\nVariance") +
+  labs(title = "WTI FIAPARCH-std: News Impact Surface",
+       x = "Standardized shock (z)", y = "Lagged variance (× unconditional)") +
+  theme_minimal()
+
+ggplot(nis_brent_fiaparch, aes(x = z, y = lagvar_ratio, fill = cond_var)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Conditional\nVariance") +
+  labs(title = "Brent FIAPARCH-std: News Impact Surface",
+       x = "Standardized shock (z)", y = "Lagged variance (× unconditional)") +
+  theme_minimal()
+```
+
+## 8. EVT: Standardised Residuals, MRL Plots, GPD Fits (u=90%)
+
+```{r evt-residuals-lm}
+z_lm <- lapply(lm_models_survivors, function(fit) as.numeric(residuals(fit)))
+```
+
+```{r evt-mrl-lm}
+for (m in names(z_lm)) {
+  par(mfrow = c(1, 2))
+  mrlplot(z_lm[[m]],  main = paste("Right Tail MRL -", m))
+  abline(v = quantile(z_lm[[m]], 0.90), col = "red", lty = 2)
+  mrlplot(-z_lm[[m]], main = paste("Left Tail MRL -", m))
+  abline(v = quantile(-z_lm[[m]], 0.90), col = "red", lty = 2)
+  par(mfrow = c(1, 1))
+}
+```
+
+```{r evt-gpd-lm}
+fit_gpd_row_lm <- function(x, name, tail, q = 0.90) {
+  u <- unname(quantile(x, q))
+  fit <- fitgpd(x, threshold = u, est = "mle")
+  data.frame(Model = name, Tail = tail, Percentile = q * 100, U = round(u, 4),
+             Shape = round(unname(fit$fitted.values["shape"]), 4),
+             Shape_SE = round(unname(fit$std.err["shape"]), 4),
+             Scale = round(unname(fit$fitted.values["scale"]), 4),
+             Scale_SE = round(unname(fit$std.err["scale"]), 4),
+             N_u = fit$nat)
+}
+
+gpd_results_lm <- do.call(rbind, lapply(names(z_lm), function(m) {
+  rbind(fit_gpd_row_lm(z_lm[[m]],  m, "Right"),
+        fit_gpd_row_lm(-z_lm[[m]], m, "Left"))
+}))
+gpd_results_lm
+saveRDS(gpd_results_lm, "longmemory_gpd_shape_table.rds")
+```
+
+## 9. Rolling Out-of-Sample Engine (fEGarch Native: steady_window=TRUE)
+
+Uses fEGarch's native `predict_roll()` with `steady_window = TRUE` for a
+genuine fixed-width moving window,
+matching the 1,000-observation window and 20-day refit cadence used in
+the short-memory and MS-GARCH suites. `n_test` is set so the initial
+training window is exactly 1,000 observations.
+
+Consistent with the short-memory suite, ALL diagnostic-gate survivors
+are rolled, not only the AIC/BIC winner. GPD tails are refit at the same
+20-day cadence. Where fEGarch's refit-enabled `predict_roll()` output
+exposes the per-refit fitted models (`@model` as a list; Schulz et al.
+2026, Section 5.3), residuals for the GPD refits are taken directly from
+those objects, so the tail estimates come from the identical fits that
+produce the sigma forecasts (matching the short-memory engine's
+internal consistency) at no extra estimation cost. If that slot is not a
+usable list, the engine falls back to manually refitting on the same
+1,000-day windows at the same boundaries (equivalent fits, roughly
+double the run time).
+
+Both ES confidence levels (97.5% and 99%) are computed in the same pass:
+VaR99, ES97.5 and ES99 are all quantile-based functionals of the same
+fitted GPD tail on the same sigma path, so a second rolling run per ES
+level (as in the short-memory file, where tail parameters were not
+retained per step) is redundant -- the resulting numbers are identical.
+
+```{r rolling-function-lm}
+gpd_tail_quantiles <- function(x, q_thresh = 0.90, p_var = 0.99,
+                               p_es_a = 0.975, p_es_b = 0.99) {
+  u  <- quantile(x, q_thresh)
+  gf <- fitgpd(x, threshold = u, est = "mle")
+  xi   <- unname(gf$fitted.values["shape"])
+  beta <- unname(gf$fitted.values["scale"])
+  n    <- length(x); nu_ex <- sum(x > u)
+  q_gpd <- function(p) u + (beta / xi) * (((1 - p) / (nu_ex / n))^(-xi) - 1)
+  es_of <- function(qp) qp / (1 - xi) + (beta - xi * u) / (1 - xi)
+  list(z_var    = q_gpd(p_var),
+       z_es_a   = es_of(q_gpd(p_es_a)),
+       z_es_b   = es_of(q_gpd(p_es_b)))
+}
+
+run_longmemory_evt_roll <- function(ret_xts, model_fun, window_size = 1000,
+                                    refit_every = 20, q_thresh = 0.90,
+                                    p_var = 0.99, p_es_a = 0.975, p_es_b = 0.99,
+                                    cond_dist = "std", label = "") {
+  y_all <- as.numeric(ret_xts)
+  n     <- length(y_all)
+  n_test <- n - window_size
+
+  zero_mean <- mean_spec(orders = c(0, 0), include_mean = FALSE)
+
+  fit0 <- tryCatch(
+    model_fun(y_all, orders = c(1,1), cond_dist = cond_dist,
+             meanspec = zero_mean, n_test = n_test),
+    error = function(e) NULL
+  )
+  if (is.null(fit0)) stop("Initial fit with n_test failed for ", label)
+
+  roll <- predict_roll(fit0, step_size = 1, refit_after = refit_every,
+                       steady_window = TRUE)
+
+  sig_roll <- as.numeric(sigt(roll))
+  test_obs <- y_all[(window_size + 1):n]
+  dates    <- index(ret_xts)[(window_size + 1):n]
+
+  n_fc <- length(sig_roll)
+  n_refits <- ceiling(n_fc / refit_every)
+
+  # Try to reuse the per-refit fitted models from predict_roll() itself
+  # (Schulz et al. 2026, Sec. 5.3: @model is a list under refitting).
+  refit_models <- tryCatch({
+    ml <- roll@model
+    if (is.list(ml) && length(ml) >= n_refits) ml else NULL
+  }, error = function(e) NULL)
+  use_native_refits <- !is.null(refit_models)
+  cat(label, "- refit residual source:",
+      if (use_native_refits) "native (roll@model)" else "manual fallback", "\n")
+
+  out <- data.frame(date = dates[seq_len(n_fc)], realized = test_obs[seq_len(n_fc)],
+                    sigma = sig_roll,
+                    VaR99_evt_L = NA_real_, ES975_evt_L = NA_real_, ES99_evt_L = NA_real_,
+                    VaR99_evt_R = NA_real_, ES975_evt_R = NA_real_, ES99_evt_R = NA_real_)
+
+  tail_L <- NULL; tail_R <- NULL
+  for (i in seq_len(n_fc)) {
+    if ((i - 1) %% refit_every == 0) {
+      k <- (i - 1) %/% refit_every + 1
+      z_in <- NULL
+      if (use_native_refits) {
+        z_in <- tryCatch(as.numeric(residuals(refit_models[[k]])), error = function(e) NULL)
+      }
+      if (is.null(z_in)) {
+        hist_end <- window_size + i - 1
+        w <- y_all[max(1, hist_end - window_size + 1):hist_end]
+        f_i <- tryCatch(model_fun(w, orders = c(1,1), cond_dist = cond_dist,
+                                  meanspec = zero_mean),
+                        error = function(e) NULL)
+        if (!is.null(f_i)) z_in <- as.numeric(residuals(f_i))
+      }
+      if (!is.null(z_in)) {
+        tail_L_new <- tryCatch(gpd_tail_quantiles(-z_in, q_thresh, p_var, p_es_a, p_es_b), error = function(e) NULL)
+        tail_R_new <- tryCatch(gpd_tail_quantiles( z_in, q_thresh, p_var, p_es_a, p_es_b), error = function(e) NULL)
+        if (!is.null(tail_L_new)) tail_L <- tail_L_new
+        if (!is.null(tail_R_new)) tail_R <- tail_R_new
+        # else: hold previous window's tail fit (fallback, matching short-memory engine)
+      }
+      cat(label, "refit", k, "of", n_refits, "(forecast step", i, "of", n_fc, ")\n")
+    }
+    if (is.null(tail_L) || is.null(tail_R)) next
+    sig_i <- sig_roll[i]
+    out$VaR99_evt_L[i] <- -sig_i * tail_L$z_var
+    out$ES975_evt_L[i] <- -sig_i * tail_L$z_es_a
+    out$ES99_evt_L[i]  <- -sig_i * tail_L$z_es_b
+    out$VaR99_evt_R[i] <-  sig_i * tail_R$z_var
+    out$ES975_evt_R[i] <-  sig_i * tail_R$z_es_a
+    out$ES99_evt_R[i]  <-  sig_i * tail_R$z_es_b
+  }
+  out
+}
+```
+
+### 9.1 Rolling Run: All Survivors (u=90%, Refit-20, Both ES Levels)
+
+Each model's result is saved to its own RDS immediately on completion,
+so a failure partway through the loop loses at most the model currently
+running (partial substitute for the checkpointing built into the
+short-memory engine, which is not possible inside native
+`predict_roll()`).
+
+```{r run-rolling-lm, eval=FALSE}
+rolling_results_lm <- list()
+
+for (m in names(lm_configs_survivors)) {
+  cfg <- lm_configs_survivors[[m]]
+  save_file <- paste0("lm_roll_", m, ".rds")
+  if (file.exists(save_file)) {
+    cat("===", m, ": already done, loading from", save_file, "===\n")
+    rolling_results_lm[[m]] <- readRDS(save_file)
+    next
+  }
+  cat("===", m, "(refit-20, u=90%) ===\n")
+  res <- tryCatch(
+    run_longmemory_evt_roll(cfg$ret, cfg$fun, cond_dist = cfg$dist, label = m),
+    error = function(e) { cat("FAILED:", m, "-", conditionMessage(e), "\n"); NULL }
+  )
+  if (!is.null(res)) {
+    rolling_results_lm[[m]] <- res
+    saveRDS(res, save_file)
+  }
+}
+
+saveRDS(rolling_results_lm, "longmemory_evt_roll_all.rds")
+```
+
+```{r violations-lm, eval=FALSE}
+violation_summary <- function(roll, label) {
+  viol_L <- roll$realized < roll$VaR99_evt_L
+  viol_R <- roll$realized > roll$VaR99_evt_R
+  cat(label, "- Left:", sum(viol_L, na.rm = TRUE),
+      "(", round(100*mean(viol_L, na.rm = TRUE), 3), "%) | Right:",
+      sum(viol_R, na.rm = TRUE), "(", round(100*mean(viol_R, na.rm = TRUE), 3), "%)\n")
+}
+for (m in names(rolling_results_lm)) violation_summary(rolling_results_lm[[m]], m)
+```
+
+## 10. Backtest Functions (esback::er_backtest, seeded)
+
+```{r backtest-functions-lm}
+kupiec_test <- function(violations, alpha) {
+  n <- length(violations); x <- sum(violations, na.rm = TRUE); pi_hat <- x / n
+  if (x == 0 || x == n) return(list(LR = NA, p = NA, rate = pi_hat, n_viol = x))
+  LR <- -2 * (log((1 - alpha)^(n - x) * alpha^x) - log((1 - pi_hat)^(n - x) * pi_hat^x))
+  list(LR = LR, p = 1 - pchisq(LR, df = 1), rate = pi_hat, n_viol = x)
+}
+
+christoffersen_test <- function(violations) {
+  v <- as.integer(violations)
+  n00 <- sum(v[-length(v)] == 0 & v[-1] == 0); n01 <- sum(v[-length(v)] == 0 & v[-1] == 1)
+  n10 <- sum(v[-length(v)] == 1 & v[-1] == 0); n11 <- sum(v[-length(v)] == 1 & v[-1] == 1)
+  p01 <- n01 / (n00 + n01); p11 <- n11 / (n10 + n11)
+  p   <- (n01 + n11) / (n00 + n01 + n10 + n11)
+  if (any(is.nan(c(p01, p11, p)))) return(list(LR_ind = NA, p_ind = NA))
+  ll_uncond <- function(pp) (n00 + n10) * log(1 - pp) + (n01 + n11) * log(pp)
+  ll_ind <- (n00*log(1-p01) + n01*log(p01) + n10*log(1-p11) + n11*log(p11))
+  LR_ind <- -2 * (ll_uncond(p) - ll_ind)
+  list(LR_ind = LR_ind, p_ind = 1 - pchisq(LR_ind, df = 1))
+}
+
+esback_test <- function(realized, VaR, ES, tail = c("left", "right"), seed = 42, B = 1000) {
+  tail <- match.arg(tail)
+  set.seed(seed)
+  ok <- !is.na(VaR) & !is.na(ES)
+  realized <- realized[ok]; VaR <- VaR[ok]; ES <- ES[ok]
+  if (tail == "left") {
+    violated <- realized < VaR
+    r <- realized[violated]; q <- VaR[violated]; e <- ES[violated]
+  } else {
+    violated <- realized > VaR
+    r <- -realized[violated]; q <- -VaR[violated]; e <- -ES[violated]
+  }
+  n_viol <- sum(violated)
+  if (n_viol < 5) return(list(n_viol = n_viol, p_twosided = NA))
+  result <- tryCatch(esback::er_backtest(r = r, q = q, e = e, B = B), error = function(e) NULL)
+  if (is.null(result)) return(list(n_viol = n_viol, p_twosided = NA))
+  list(n_viol = n_viol, p_twosided = round(result$pvalue_twosided_simple, 4))
+}
+
+runs_test <- function(violations) {
+  v <- as.integer(violations); n <- length(v); n1 <- sum(v, na.rm = TRUE); n0 <- n - n1
+  if (n1 == 0 || n0 == 0) return(list(z = NA, p = NA))
+  runs <- 1 + sum(diff(v) != 0, na.rm = TRUE)
+  mu   <- 2 * n1 * n0 / n + 1
+  var_ <- 2 * n1 * n0 * (2 * n1 * n0 - n) / (n^2 * (n - 1))
+  z <- (runs - mu) / sqrt(var_)
+  list(z = z, p = 2 * (1 - pnorm(abs(z))))
+}
+```
+
+## 11. Primary Backtest (All Survivors: u=90%, Refit-20, VaR99/ES97.5)
+
+```{r backtest-run-lm, eval=FALSE}
+run_backtest_row_lm <- function(roll, tail = c("left", "right"), label = "",
+                                es_col_suffix = "ES975_evt") {
+  tail <- match.arg(tail)
+  tsuf <- if (tail == "left") "_L" else "_R"
+  VaR <- roll[[paste0("VaR99_evt", tsuf)]]
+  ES  <- roll[[paste0(es_col_suffix, tsuf)]]
+  realized <- roll$realized
+  viol <- if (tail == "left") realized < VaR else realized > VaR
+
+  kup <- kupiec_test(viol[!is.na(viol)], 0.01)
+  chr <- christoffersen_test(viol[!is.na(viol)])
+  eb  <- esback_test(realized, VaR, ES, tail)
+  run <- runs_test(viol[!is.na(viol)])
+
+  data.frame(Model = label, Tail = tail, n_viol = kup$n_viol,
+             rate_pct = round(100 * kup$rate, 3), Kupiec_p = round(kup$p, 4),
+             Christoffersen_p = round(chr$p_ind, 4),
+             esback_p = eb$p_twosided, Runs_p = round(run$p, 4))
+}
+
+run_all_backtests_lm <- function(roll_list, es_col_suffix = "ES975_evt") {
+  do.call(rbind, unlist(lapply(names(roll_list), function(m) {
+    list(run_backtest_row_lm(roll_list[[m]], "left",  m, es_col_suffix),
+         run_backtest_row_lm(roll_list[[m]], "right", m, es_col_suffix))
+  }), recursive = FALSE))
+}
+
+backtest_lm_primary <- run_all_backtests_lm(rolling_results_lm, "ES975_evt")
+backtest_lm_primary
+write.csv(backtest_lm_primary, "longmemory_backtest_primary_esback.csv", row.names = FALSE)
+```
+
+## 12. VaR99/ES97.5 vs VaR99/ES99 Comparison (u=90%, Refit-20 Fixed)
+
+No threshold sweep is performed; the GPD threshold is fixed at the
+MRL-confirmed 90th percentile throughout, matching the short-memory
+suite. Two confidence pairings are compared at this fixed threshold: the
+primary Basel FRTB pairing (VaR99/ES97.5) and a stricter pairing
+(VaR99/ES99), to test whether the ES confidence level itself affects
+exceedance-residual calibration. Both were computed in the single
+rolling pass above (identical sigma path and GPD fits; only the ES
+quantile differs), so no second run is required.
+
+```{r es-comparison-backtest-lm, eval=FALSE}
+es_comparison_lm <- rbind(
+  cbind(ES_level = "97.5%", run_all_backtests_lm(rolling_results_lm, "ES975_evt")),
+  cbind(ES_level = "99%",   run_all_backtests_lm(rolling_results_lm, "ES99_evt"))
+)
+es_comparison_lm
+write.csv(es_comparison_lm, "longmemory_es_comparison.csv", row.names = FALSE)
+```
+
+## 13. Out-of-Sample Forecast Accuracy (MSE, MAE, QLIKE)
+
+Matches the metrics used in the short-memory and MS-GARCH suites for
+consistency in the eventual cross-framework comparison.
+
+```{r oos-accuracy-lm, eval=FALSE}
+oos_accuracy_lm <- function(roll, label) {
+  realized_var <- roll$realized^2
+  forecast_var <- roll$sigma^2
+  data.frame(Model = label,
+             MSE  = round(mean((realized_var - forecast_var)^2, na.rm = TRUE), 4),
+             MAE  = round(mean(abs(realized_var - forecast_var), na.rm = TRUE), 4),
+             QLIKE = round(mean(log(forecast_var) + realized_var / forecast_var, na.rm = TRUE), 4))
+}
+
+oos_lm_table <- do.call(rbind, lapply(names(rolling_results_lm), function(m) {
+  oos_accuracy_lm(rolling_results_lm[[m]], m)
+}))
+oos_lm_table
+write.csv(oos_lm_table, "longmemory_oos_accuracy.csv", row.names = FALSE)
+```
+```{r save-final-dminput, eval=FALSE}
+saveRDS(list(
+  wti   = list(realized = longmemory_evt_roll_all[["WTI_FIAPARCH_std"]]$realized,
+               VaR_L    = longmemory_evt_roll_all[["WTI_FIAPARCH_std"]]$VaR99_evt_L,
+               VaR_R    = longmemory_evt_roll_all[["WTI_FIAPARCH_std"]]$VaR99_evt_R,
+               Date     = longmemory_evt_roll_all[["WTI_FIAPARCH_std"]]$date),
+  brent = list(realized = longmemory_evt_roll_all[["Brent_FIAPARCH_std"]]$realized,
+               VaR_L    = longmemory_evt_roll_all[["Brent_FIAPARCH_std"]]$VaR99_evt_L,
+               VaR_R    = longmemory_evt_roll_all[["Brent_FIAPARCH_std"]]$VaR99_evt_R,
+               Date     = longmemory_evt_roll_all[["Brent_FIAPARCH_std"]]$date)
+), file = "longmemory_dm_input.rds")
+
+cat("Long-memory DM input saved.\n")
+```
+
+## 14. Save Final Outputs (Consistent Naming for Cross-Framework Comparison)
+
+```{r save-final-lm, eval=FALSE}
+saveRDS(list(
+  fits = lm_models,
+  gpd_table = gpd_results_lm,
+  rolling_results = rolling_results_lm,
+  backtest_primary = backtest_lm_primary,
+  es_comparison = es_comparison_lm,
+  oos_accuracy = oos_lm_table
+), file = "longmemory_final_output.rds")
+
+cat("Long-memory final outputs saved.\n")
+```
