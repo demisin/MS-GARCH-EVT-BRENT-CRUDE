@@ -1,0 +1,978 @@
+---
+title: "Msc Financial Risk Management Diss - Short Memory GARCH (Master)"
+author: "Demi Gray"
+date: "2026-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4)
+```
+
+## 1. Package Installation
+
+```{r install-packages, eval=FALSE}
+install.packages(c(
+  "quantmod", "readxl", "xts", "zoo", "dplyr", "ggplot2",
+  "rugarch", "fEGarch", "MSGARCH", "evir", "POT", "esback",
+  "PerformanceAnalytics", "moments", "tseries", "urca"
+))
+```
+
+## 2. Package Imports
+
+```{r package-imports, message=FALSE, warning=FALSE}
+library(quantmod)
+library(readxl)
+library(xts)
+library(zoo)
+library(dplyr)
+library(ggplot2)
+library(rugarch)
+library(fEGarch)
+library(MSGARCH)
+library(evir)
+library(POT)
+library(esback)
+library(PerformanceAnalytics)
+library(moments)
+library(tseries)
+library(urca)
+```
+
+## 3. CSV Import & Log Return of Time Series (Spot Data)
+
+```{r data-import}
+wti_raw   <- read.csv("WTI SPOT CSV.csv",   skip = 5, header = TRUE)
+brent_raw <- read.csv("BRENT SPOT CSV.csv", skip = 5, header = TRUE)
+
+colnames(wti_raw)   <- c("Date", "Price")
+colnames(brent_raw) <- c("Date", "Price")
+
+wti_raw$Date   <- as.Date(wti_raw$Date,   format = "%m/%d/%Y")
+brent_raw$Date <- as.Date(brent_raw$Date, format = "%m/%d/%Y")
+
+wti_raw   <- wti_raw[!is.na(wti_raw$Date)   & !is.na(wti_raw$Price), ]
+brent_raw <- brent_raw[!is.na(brent_raw$Date) & !is.na(brent_raw$Price), ]
+
+wti_raw   <- wti_raw[order(wti_raw$Date), ]
+brent_raw <- brent_raw[order(brent_raw$Date), ]
+
+wti_xts   <- xts(wti_raw$Price,   order.by = wti_raw$Date)
+brent_xts <- xts(brent_raw$Price, order.by = brent_raw$Date)
+
+colnames(wti_xts)   <- "Price"
+colnames(brent_xts) <- "Price"
+```
+
+```{r trim-and-clean}
+start_date <- as.Date("2010-01-01")
+end_date   <- as.Date("2025-12-31")
+
+wti_xts   <- wti_xts[paste(start_date, end_date, sep = "/")]
+brent_xts <- brent_xts[paste(start_date, end_date, sep = "/")]
+
+# Exclude the 20 April 2020 negative WTI price (log-return undefined for P <= 0)
+wti_xts <- wti_xts[index(wti_xts) != as.Date("2020-04-20"), ]
+```
+
+```{r construct-returns}
+wti_ret   <- 100 * diff(log(wti_xts))
+brent_ret <- 100 * diff(log(brent_xts))
+
+wti_ret   <- na.omit(wti_ret)
+brent_ret <- na.omit(brent_ret)
+
+cat("WTI observations (pre-final-exclusion):", nrow(wti_ret), "\n")
+cat("Brent observations:", nrow(brent_ret), "\n")
+```
+
+```{r data-quality-check}
+sum(is.na(wti_raw$Price))
+sum(is.na(brent_raw$Price))
+```
+
+```{r final-exclusions-check}
+# Exclude the contaminated 21 April 2020 return (downstream of the excluded 20 April price)
+wti_ret <- wti_ret[index(wti_ret) != as.Date("2020-04-21"), ]
+
+n_wti   <- nrow(wti_ret)
+n_brent <- nrow(brent_ret)
+
+cat("WTI observations:", n_wti, "\n")
+cat("Brent observations:", n_brent, "\n")
+```
+
+## 4. Preliminary Analysis
+
+Preliminary analysis is conducted jointly for WTI and Brent to allow direct
+comparison of their unconditional properties ahead of model estimation.
+
+### 4.1 Descriptive Statistics
+
+```{r descriptive-stats}
+desc_stats <- function(x, name) {
+  x <- as.numeric(x)
+  jb <- jarque.bera.test(x)
+  data.frame(
+    Series     = name,
+    Mean       = mean(x),
+    SD         = sd(x),
+    Skewness   = skewness(x),
+    ExcKurt    = kurtosis(x) - 3,
+    Min        = min(x),
+    Max        = max(x),
+    JB_stat    = unname(jb$statistic),
+    JB_pvalue  = jb$p.value
+  )
+}
+
+desc_table <- rbind(
+  desc_stats(wti_ret,   "WTI"),
+  desc_stats(brent_ret, "Brent")
+)
+desc_table
+```
+
+### 4.2 Stationarity
+
+```{r stationarity-tests}
+stationarity_row <- function(x, name) {
+  x <- as.numeric(na.omit(x))
+  adf  <- adf.test(x)
+  kpss <- ur.kpss(x, type = "mu")
+  data.frame(
+    Series    = name,
+    ADF_stat  = unname(adf$statistic),
+    ADF_pval  = adf$p.value,
+    KPSS_stat = kpss@teststat,
+    KPSS_5pct = kpss@cval[1, "5pct"]
+  )
+}
+
+stationarity_table <- rbind(
+  stationarity_row(wti_xts,   "WTI - Price level"),
+  stationarity_row(wti_ret,   "WTI - Returns"),
+  stationarity_row(brent_xts, "Brent - Price level"),
+  stationarity_row(brent_ret, "Brent - Returns")
+)
+stationarity_table
+```
+
+### 4.3 Autocorrelation & Volatility Clustering
+
+```{r ljung-box}
+lb_row <- function(x, lag, name) {
+  x <- as.numeric(x)
+  raw <- Box.test(x,   lag = lag, type = "Ljung-Box")
+  sq  <- Box.test(x^2, lag = lag, type = "Ljung-Box")
+  data.frame(
+    Series     = name,
+    Lag        = lag,
+    LB_raw     = unname(raw$statistic),
+    LB_raw_p   = raw$p.value,
+    LB_squared = unname(sq$statistic),
+    LB_sq_p    = sq$p.value
+  )
+}
+
+lags <- c(5, 10, 20)
+lb_table <- do.call(rbind, c(
+  lapply(lags, lb_row, x = wti_ret,   name = "WTI"),
+  lapply(lags, lb_row, x = brent_ret, name = "Brent")
+))
+lb_table
+```
+
+### 4.4 Visual Inspection
+
+```{r plot-returns}
+plot.xts(wti_ret,   main = "WTI Log-Returns")
+plot.xts(brent_ret, main = "Brent Log-Returns")
+```
+
+```{r plot-acf-squared}
+acf(as.numeric(wti_ret)^2,   lag.max = 40, main = "ACF of Squared WTI Returns")
+acf(as.numeric(brent_ret)^2, lag.max = 40, main = "ACF of Squared Brent Returns")
+```
+
+### 4.5 Mean Equation Specification Check
+
+```{r mean-equation-check}
+spec_zero <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+                         mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                         distribution.model = "std")
+
+spec_ar1  <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1,1)),
+                         mean.model = list(armaOrder = c(1,0), include.mean = TRUE),
+                         distribution.model = "std")
+
+fit_wti_zero <- ugarchfit(spec = spec_zero, data = wti_ret)
+fit_wti_ar1  <- ugarchfit(spec = spec_ar1,  data = wti_ret)
+
+fit_brent_zero <- ugarchfit(spec = spec_zero, data = brent_ret)
+fit_brent_ar1  <- ugarchfit(spec = spec_ar1,  data = brent_ret)
+
+mean_spec_check <- data.frame(
+  Series = c("WTI", "WTI", "Brent", "Brent"),
+  Spec   = c("Zero-mean", "AR(1)-mean", "Zero-mean", "AR(1)-mean"),
+  AIC    = c(infocriteria(fit_wti_zero)[1],   infocriteria(fit_wti_ar1)[1],
+             infocriteria(fit_brent_zero)[1], infocriteria(fit_brent_ar1)[1]),
+  BIC    = c(infocriteria(fit_wti_zero)[2],   infocriteria(fit_wti_ar1)[2],
+             infocriteria(fit_brent_zero)[2], infocriteria(fit_brent_ar1)[2]),
+  LB_std_resid_p = c(
+    Box.test(residuals(fit_wti_zero,   standardize = TRUE), lag = 10, type = "Ljung-Box")$p.value,
+    Box.test(residuals(fit_wti_ar1,    standardize = TRUE), lag = 10, type = "Ljung-Box")$p.value,
+    Box.test(residuals(fit_brent_zero, standardize = TRUE), lag = 10, type = "Ljung-Box")$p.value,
+    Box.test(residuals(fit_brent_ar1,  standardize = TRUE), lag = 10, type = "Ljung-Box")$p.value
+  )
+)
+
+mean_spec_check
+```
+
+Conclusion: standardised residuals from the zero-mean specification already
+show no significant autocorrelation for either series, and AR(1) inclusion
+does not materially improve AIC/BIC or residual diagnostics. A
+conditional-mean-zero specification is retained for the GARCH suite
+going forward.
+
+### 4.5b Direct Test of Zero Mean (One-Sample t-test)
+
+```{r mean-ttest}
+t.test(as.numeric(wti_ret),   mu = 0)
+t.test(as.numeric(brent_ret), mu = 0)
+```
+
+## 5. Short-Memory GARCH Suite
+
+```{r garch-suite}
+specs <- list(
+  sGARCH_norm   = ugarchspec(variance.model = list(model = "sGARCH",   garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "norm"),
+  sGARCH_std    = ugarchspec(variance.model = list(model = "sGARCH",   garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "std"),
+  eGARCH_norm   = ugarchspec(variance.model = list(model = "eGARCH",   garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "norm"),
+  eGARCH_std    = ugarchspec(variance.model = list(model = "eGARCH",   garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "std"),
+  gjrGARCH_norm = ugarchspec(variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "norm"),
+  gjrGARCH_std  = ugarchspec(variance.model = list(model = "gjrGARCH", garchOrder = c(1,1)),
+                              mean.model = list(armaOrder = c(0,0), include.mean = FALSE),
+                              distribution.model = "std")
+)
+
+fit_wti   <- lapply(specs, function(s) ugarchfit(spec = s, data = wti_ret))
+fit_brent <- lapply(specs, function(s) ugarchfit(spec = s, data = brent_ret))
+```
+
+### 5.1b Convergence Check
+
+Confirms every one of the 12 fits reached a genuine converged solution
+before anything downstream (model selection, EVT, rolling) relies on them.
+
+```{r convergence-check}
+conv_check <- function(fit_list, series_name) {
+  data.frame(
+    Series = series_name,
+    Model  = names(fit_list),
+    Converged = sapply(fit_list, function(f) convergence(f) == 0)
+  )
+}
+
+conv_table <- rbind(
+  conv_check(fit_wti,   "WTI"),
+  conv_check(fit_brent, "Brent")
+)
+conv_table
+
+if (!all(conv_table$Converged)) {
+  cat("WARNING: the following fits did not converge and should be",
+      "investigated before proceeding:\n")
+  print(conv_table[!conv_table$Converged, ])
+} else {
+  cat("All 12 fits converged successfully.\n")
+}
+```
+
+### 5.2 Model Selection: AIC/BIC Comparison
+
+```{r garch-model-selection}
+ic_wti   <- t(sapply(fit_wti,   infocriteria))
+ic_brent <- t(sapply(fit_brent, infocriteria))
+colnames(ic_wti) <- colnames(ic_brent) <- c("AIC","BIC","Shibata","HQIC")
+
+cat("=== WTI: AIC/BIC across specifications ===\n")
+print(ic_wti)
+
+cat("\n=== Brent: AIC/BIC across specifications ===\n")
+print(ic_brent)
+```
+
+### 5.3 Residual Diagnostics (Full Table, All 12 Combinations)
+
+```{r garch-diagnostics}
+diag_check <- function(fit, name) {
+  z <- residuals(fit, standardize = TRUE)
+  lb_raw <- Box.test(z,   lag = 10, type = "Ljung-Box")
+  lb_sq  <- Box.test(z^2, lag = 10, type = "Ljung-Box")
+  data.frame(Model = name, LB_raw_p = lb_raw$p.value, LB_sq_p = lb_sq$p.value)
+}
+
+cat("=== WTI: standardised residual diagnostics ===\n")
+diag_table_wti <- do.call(rbind, Map(diag_check, fit_wti, names(fit_wti)))
+print(diag_table_wti)
+
+cat("\n=== Brent: standardised residual diagnostics ===\n")
+diag_table_brent <- do.call(rbind, Map(diag_check, fit_brent, names(fit_brent)))
+print(diag_table_brent)
+```
+
+### 5.3b Degrees of Freedom (Student-t Shape Parameter)
+
+```{r dof-table-final}
+std_models <- c("sGARCH_std", "eGARCH_std", "gjrGARCH_std")
+dof_table <- data.frame(
+  Model     = std_models,
+  WTI_DoF   = sapply(std_models, function(m) coef(fit_wti[[m]])["shape"]),
+  Brent_DoF = sapply(std_models, function(m) coef(fit_brent[[m]])["shape"])
+)
+dof_table
+```
+
+### 5.4 In-Sample Forecast Evaluation (MSE, MAE, QLIKE)
+
+```{r forecast-evaluation}
+forecast_eval <- function(fit, realised_returns) {
+  sigma2_hat <- as.numeric(sigma(fit))^2
+  proxy      <- as.numeric(realised_returns)^2
+
+  mse    <- mean((sigma2_hat - proxy)^2)
+  mae    <- mean(abs(sigma2_hat - proxy))
+  qlike  <- mean(log(sigma2_hat) + proxy / sigma2_hat)
+
+  data.frame(MSE = mse, MAE = mae, QLIKE = qlike)
+}
+
+cat("=== WTI: In-sample forecast evaluation ===\n")
+eval_wti <- do.call(rbind, Map(function(fit, name) {
+  cbind(Model = name, forecast_eval(fit, wti_ret))
+}, fit_wti, names(fit_wti)))
+print(eval_wti)
+
+cat("\n=== Brent: In-sample forecast evaluation ===\n")
+eval_brent <- do.call(rbind, Map(function(fit, name) {
+  cbind(Model = name, forecast_eval(fit, brent_ret))
+}, fit_brent, names(fit_brent)))
+print(eval_brent)
+```
+
+## 6. Diagnostic Gate: Determining Which Models Carry Forward to EVT
+
+Rather than a fixed pre-selected shortlist, every one of the 12 combinations
+is screened against an explicit pass/fail rule: standardised residuals must
+show no significant autocorrelation (Ljung-Box, raw and squared, p > 0.05
+at lag 10). Every model that passes for a given series is carried forward
+into EVT, threshold selection, the rolling engine, and backtesting -- the
+number of survivors is determined by the data, not fixed in advance.
+
+```{r diagnostic-gate}
+gate_pass <- function(diag_table, alpha = 0.05) {
+  diag_table$Model[diag_table$LB_raw_p > alpha & diag_table$LB_sq_p > alpha]
+}
+
+survivors_wti   <- gate_pass(diag_table_wti)
+survivors_brent <- gate_pass(diag_table_brent)
+
+cat("WTI models passing the diagnostic gate:\n");   print(survivors_wti)
+cat("\nBrent models passing the diagnostic gate:\n"); print(survivors_brent)
+
+# Models carried forward per series (may differ between WTI and Brent)
+model_names <- union(survivors_wti, survivors_brent)
+cat("\nCombined set of models entering EVT (any series):\n"); print(model_names)
+```
+
+## 7. Extreme Value Theory: Tail Modelling
+
+EVT is applied to the standardised residuals of every surviving model,
+following the two-step conditional EVT approach of McNeil and Frey (2000).
+Left and right tails are treated separately throughout, consistent with
+evidence that WTI's and Brent's tails behave asymmetrically
+(Krehbiel & Adkins, 2005).
+
+### 7.1 Standardised Residuals
+
+```{r evt-setup}
+get_z <- function(fit_list, model_name) {
+  as.numeric(residuals(fit_list[[model_name]], standardize = TRUE))
+}
+
+z_wti   <- setNames(lapply(intersect(model_names, survivors_wti),   get_z, fit_list = fit_wti),
+                    intersect(model_names, survivors_wti))
+z_brent <- setNames(lapply(intersect(model_names, survivors_brent), get_z, fit_list = fit_brent),
+                    intersect(model_names, survivors_brent))
+```
+
+### 7.2 Threshold Selection (Mean Residual Life), u = 90%
+
+```{r evt-mrl-plots, fig.width=10, fig.height=4.5}
+
+# WTI
+for (m in names(z_wti)) {
+  par(mfrow = c(1, 2))
+  mrlplot(z_wti[[m]],  main = paste("Right Tail MRL -", m))
+  abline(v = quantile(z_wti[[m]], 0.90), col = "red", lty = 2)
+  mrlplot(-z_wti[[m]], main = paste("Left Tail MRL -", m))
+  abline(v = quantile(-z_wti[[m]], 0.90), col = "red", lty = 2)
+  mtext(paste("WTI:", m), outer = TRUE, line = -1.5, cex = 1.1, font = 2)
+  par(mfrow = c(1, 1))
+}
+
+# Brent
+for (m in names(z_brent)) {
+  par(mfrow = c(1, 2))
+  mrlplot(z_brent[[m]],  main = paste("Right Tail MRL -", m))
+  abline(v = quantile(z_brent[[m]], 0.90), col = "red", lty = 2)
+  mrlplot(-z_brent[[m]], main = paste("Left Tail MRL -", m))
+  abline(v = quantile(-z_brent[[m]], 0.90), col = "red", lty = 2)
+  mtext(paste("Brent:", m), outer = TRUE, line = -1.5, cex = 1.1, font = 2)
+  par(mfrow = c(1, 1))
+}
+```
+
+### 7.3 Threshold Values Across Percentiles (90-99%), All Surviving Combinations
+
+```{r evt-percentile-table}
+percentile_grid <- seq(0.90, 0.99, by = 0.01)
+
+build_pct_row <- function(x, series, model, tail) {
+  vals <- quantile(x, percentile_grid)
+  df <- data.frame(Series = series, Model = model, Tail = tail,
+                    Percentile = percentile_grid * 100,
+                    U = round(unname(vals), 4))
+  rownames(df) <- NULL
+  df
+}
+
+pct_table <- rbind(
+  do.call(rbind, lapply(names(z_wti), function(m)
+    rbind(build_pct_row(z_wti[[m]],  "WTI", m, "Right"),
+          build_pct_row(-z_wti[[m]], "WTI", m, "Left")))),
+  do.call(rbind, lapply(names(z_brent), function(m)
+    rbind(build_pct_row(z_brent[[m]],  "Brent", m, "Right"),
+          build_pct_row(-z_brent[[m]], "Brent", m, "Left"))))
+)
+pct_table
+```
+
+### 7.4 GPD Tail Fitting at u = 90% (Primary Specification)
+
+Shape and scale parameters (with standard errors) are retained for the
+later cross-framework tail-asymmetry comparison.
+
+```{r evt-gpd-fit-all}
+fit_gpd_row <- function(x, series, model, tail, q = 0.90) {
+  u <- unname(quantile(x, q))
+  fit <- fitgpd(x, threshold = u, est = "mle")
+  data.frame(
+    Series = series, Model = model, Tail = tail,
+    Percentile = q * 100, U = round(u, 4),
+    Shape = round(unname(fit$fitted.values["shape"]), 4),
+    Shape_SE = round(unname(fit$std.err["shape"]), 4),
+    Scale = round(unname(fit$fitted.values["scale"]), 4),
+    Scale_SE = round(unname(fit$std.err["scale"]), 4),
+    N_u = fit$nat
+  )
+}
+
+gpd_results <- rbind(
+  do.call(rbind, lapply(names(z_wti), function(m)
+    rbind(fit_gpd_row(z_wti[[m]],  "WTI", m, "Right"),
+          fit_gpd_row(-z_wti[[m]], "WTI", m, "Left")))),
+  do.call(rbind, lapply(names(z_brent), function(m)
+    rbind(fit_gpd_row(z_brent[[m]],  "Brent", m, "Right"),
+          fit_gpd_row(-z_brent[[m]], "Brent", m, "Left"))))
+)
+gpd_results
+
+saveRDS(gpd_results, "shortmemory_gpd_shape_table.rds")
+```
+
+## 8. News Impact Curves (Every Surviving Model)
+
+NICs show how conditional variance responds to a standardized shock z,
+holding lagged variance at its unconditional level. sGARCH curves are
+symmetric parabolas; eGARCH and gjrGARCH show the expected kink/asymmetry
+at zero, consistent with the leverage effect.
+
+```{r nic-function}
+news_impact_curve <- function(fit, model_type, z_range = seq(-4, 4, by = 0.05)) {
+  cf <- coef(fit)
+  h_uncond <- uncvariance(fit)
+  z <- z_range
+
+  h <- switch(model_type,
+    "sGARCH" = cf["omega"] + cf["alpha1"] * (z * sqrt(h_uncond))^2,
+
+    "eGARCH" = h_uncond * exp(cf["alpha1"] * (abs(z) - sqrt(2/pi)) +
+                              cf["gamma1"] * z),
+
+    "gjrGARCH" = cf["omega"] +
+                (cf["alpha1"] + cf["gamma1"] * (z < 0)) * (z * sqrt(h_uncond))^2
+  )
+  data.frame(z = z, h = as.numeric(h), model = model_type)
+}
+
+model_type_of <- function(model_name) {
+  if (grepl("^sGARCH", model_name)) "sGARCH"
+  else if (grepl("^eGARCH", model_name)) "eGARCH"
+  else if (grepl("^gjrGARCH", model_name)) "gjrGARCH"
+}
+```
+
+```{r nic-plots-wti, fig.height=5}
+nic_wti_list <- lapply(names(z_wti), function(m) {
+  news_impact_curve(fit_wti[[m]], model_type_of(m))
+})
+nic_wti_df <- do.call(rbind, Map(function(df, m) cbind(df, combo = m), nic_wti_list, names(z_wti)))
+
+ggplot(nic_wti_df, aes(z, h, color = combo)) +
+  geom_line(linewidth = 1) +
+  labs(title = "WTI: News Impact Curves (surviving models)",
+       x = "Standardized shock (z)", y = "Conditional variance") +
+  theme_minimal()
+```
+
+```{r nic-plots-brent, fig.height=5}
+nic_brent_list <- lapply(names(z_brent), function(m) {
+  news_impact_curve(fit_brent[[m]], model_type_of(m))
+})
+nic_brent_df <- do.call(rbind, Map(function(df, m) cbind(df, combo = m), nic_brent_list, names(z_brent)))
+
+ggplot(nic_brent_df, aes(z, h, color = combo)) +
+  geom_line(linewidth = 1) +
+  labs(title = "Brent: News Impact Curves (surviving models)",
+       x = "Standardized shock (z)", y = "Conditional variance") +
+  theme_minimal()
+```
+
+## 9. Parametric vs EVT Tail Comparison
+
+Compares each model's native (Gaussian/Student-t) quantile-based VaR/ES
+against the GPD-corrected EVT version, at both the primary Basel FRTB
+pairing (VaR99/ES97.5) and the stricter VaR99/ES99 pairing -- the same
+question tested for MS-GARCH: does the assumed conditional distribution's
+own tail suffice, or does the GPD correction add real value.
+
+```{r parametric-var-es}
+parametric_var_es <- function(fit, tail = c("left", "right"),
+                              alpha_var = 0.01, alpha_es = 0.025) {
+  tail <- match.arg(tail)
+  dist <- fit@model$modeldesc$distribution
+  shape <- if (dist %in% c("std", "sstd")) coef(fit)["shape"] else NULL
+  fc <- ugarchforecast(fit, n.ahead = 1)
+  sigma_f <- as.numeric(sigma(fc))
+  q_fun <- function(p) qdist(dist, p, mu = 0, sigma = 1, shape = shape)
+  if (tail == "left") {
+    q_var <- q_fun(alpha_var)
+    es_val <- integrate(q_fun, lower = 1e-6, upper = alpha_es)$value / alpha_es
+  } else {
+    q_var <- q_fun(1 - alpha_var)
+    es_val <- integrate(q_fun, lower = 1 - alpha_es, upper = 1 - 1e-6)$value / alpha_es
+  }
+  list(VaR = sigma_f * q_var, ES = sigma_f * es_val)
+}
+
+param_vs_evt_row <- function(fit, z_raw, series, model, tail, alpha_es) {
+  # z_raw: standardised residuals, sign as-is (positive = right tail exceedances)
+  # For left tail, caller passes -z so exceedances are positive; we flip sign at end
+  is_left <- tolower(tail) == "left"
+  x_evt <- if (is_left) -z_raw else z_raw   # always work on positive exceedances
+
+  par <- parametric_var_es(fit, tail = tolower(tail), alpha_es = alpha_es)
+
+  u   <- unname(quantile(x_evt, 0.90))
+  gpd <- fitgpd(x_evt, threshold = u, est = "mle")
+  xi  <- unname(gpd$fitted.values["shape"])
+  beta <- unname(gpd$fitted.values["scale"])
+  N_u <- gpd$nat; n <- length(x_evt)
+
+  # GPD quantile at ES level (alpha_es is the TAIL probability, e.g. 0.025)
+  z_var_gpd <- u + (beta / xi) * (((n / N_u) * alpha_es)^(-xi) - 1)
+
+  # McNeil-Frey ES formula
+  es_std <- z_var_gpd / (1 - xi) + (beta - xi * u) / (1 - xi)
+
+  fc <- ugarchforecast(fit, n.ahead = 1)
+  sigma_f <- as.numeric(sigma(fc))
+
+  # Scale and apply sign: left tail ES is negative
+  es_evt_scaled <- sigma_f * es_std * if (is_left) -1 else 1
+
+  data.frame(Series = series, Model = model, Tail = tail,
+             ES_level = 1 - alpha_es,
+             ES_parametric = round(par$ES, 4),
+             ES_EVT = round(es_evt_scaled, 4))
+}
+
+param_evt_table <- rbind(
+  do.call(rbind, lapply(names(z_wti), function(m) rbind(
+    param_vs_evt_row(fit_wti[[m]], z_wti[[m]],  "WTI", m, "Right", 0.025),
+    param_vs_evt_row(fit_wti[[m]], z_wti[[m]],  "WTI", m, "Left",  0.025),
+    param_vs_evt_row(fit_wti[[m]], z_wti[[m]],  "WTI", m, "Right", 0.01),
+    param_vs_evt_row(fit_wti[[m]], z_wti[[m]],  "WTI", m, "Left",  0.01)
+  ))),
+  do.call(rbind, lapply(names(z_brent), function(m) rbind(
+    param_vs_evt_row(fit_brent[[m]], z_brent[[m]],  "Brent", m, "Right", 0.025),
+    param_vs_evt_row(fit_brent[[m]], z_brent[[m]],  "Brent", m, "Left",  0.025),
+    param_vs_evt_row(fit_brent[[m]], z_brent[[m]],  "Brent", m, "Right", 0.01),
+    param_vs_evt_row(fit_brent[[m]], z_brent[[m]],  "Brent", m, "Left",  0.01)
+  )))
+)
+param_evt_table
+```
+
+## 10. Rolling Out-of-Sample VaR/ES: Generalized Engine
+
+One rolling function, parameterized by threshold, refit frequency, and
+ES confidence level -- mirrors the MS-GARCH design. tryCatch fallbacks on
+both the GARCH refit (hold previous window's fit on failure) and the GPD
+refit (hold previous window's tail fit on failure) so a single problematic
+window cannot halt a long run. Checkpointed every 5 refits, resumable.
+
+```{r rolling-engine-generalized}
+rolling_var_es_gen <- function(returns, spec, window_size = 1000,
+                               refit_every = 20, q_thresh = 0.90,
+                               p_var = 0.99, p_es = 0.975,
+                               label = "", checkpoint_file) {
+  n <- length(returns)
+  n_forecasts <- n - window_size
+
+  start_i <- 1
+  if (file.exists(checkpoint_file)) {
+    cp <- readRDS(checkpoint_file)
+    out <- cp$out; current_fit <- cp$current_fit
+    tail_gpd <- cp$tail_gpd
+    start_i <- cp$last_i + 1
+    cat(label, "resuming from checkpoint at step", start_i, "of", n_forecasts, "\n")
+  } else {
+    out <- data.frame(
+      Date = as.Date(rep(NA, n_forecasts)), Actual = numeric(n_forecasts),
+      Sigma = numeric(n_forecasts),
+      VaR_Left = numeric(n_forecasts), ES_Left = numeric(n_forecasts),
+      VaR_Right = numeric(n_forecasts), ES_Right = numeric(n_forecasts)
+    )
+    current_fit <- NULL; tail_gpd <- list(left = NULL, right = NULL)
+  }
+
+  for (i in start_i:n_forecasts) {
+    if (i %% 100 == 0) cat(label, "iteration", i, "of", n_forecasts, "\n")
+    window_data <- returns[i:(i + window_size - 1)]
+
+    if ((i - 1) %% refit_every == 0) {
+      f_new <- tryCatch(ugarchfit(spec = spec, data = window_data, solver = "hybrid"),
+                        error = function(e) NULL)
+      if (!is.null(f_new) && convergence(f_new) == 0) current_fit <- f_new
+      # else: hold previous current_fit (fallback)
+      if (is.null(current_fit)) stop("No valid fit at step ", i, " and no prior fit to fall back on.")
+
+      z <- as.numeric(residuals(current_fit, standardize = TRUE))
+      u_r <- unname(quantile(z,  q_thresh)); u_l <- unname(quantile(-z, q_thresh))
+
+      gpd_r_new <- tryCatch(fitgpd(z,  threshold = u_r, est = "mle"), error = function(e) NULL)
+      gpd_l_new <- tryCatch(fitgpd(-z, threshold = u_l, est = "mle"), error = function(e) NULL)
+      if (!is.null(gpd_r_new)) tail_gpd$right <- list(fit = gpd_r_new, u = u_r, n = length(z))
+      if (!is.null(gpd_l_new)) tail_gpd$left  <- list(fit = gpd_l_new, u = u_l, n = length(z))
+      if (is.null(tail_gpd$right) || is.null(tail_gpd$left))
+        stop("GPD fit failed at step ", i, " with no prior tail fit to fall back on.")
+    }
+
+    spec_fixed <- getspec(current_fit)
+    setfixed(spec_fixed) <- as.list(coef(current_fit))
+    fc <- tryCatch(ugarchforecast(spec_fixed, data = window_data, n.ahead = 1),
+                   error = function(e) NULL)
+    sigma_f <- if (!is.null(fc)) as.numeric(sigma(fc)) else NA_real_
+
+    calc_q <- function(tg, level) {
+      xi <- unname(tg$fit$fitted.values["shape"]); beta <- unname(tg$fit$fitted.values["scale"])
+      N_u <- tg$fit$nat; n_z <- tg$n
+      tg$u + (beta/xi) * (((n_z/N_u) * (1 - level))^(-xi) - 1)
+    }
+
+    z_var_r <- calc_q(tail_gpd$right, p_var); z_es_r <- calc_q(tail_gpd$right, p_es)
+    z_var_l <- calc_q(tail_gpd$left,  p_var); z_es_l <- calc_q(tail_gpd$left,  p_es)
+
+    beta_r <- unname(tail_gpd$right$fit$fitted.values["scale"]); xi_r <- unname(tail_gpd$right$fit$fitted.values["shape"])
+    beta_l <- unname(tail_gpd$left$fit$fitted.values["scale"]);  xi_l <- unname(tail_gpd$left$fit$fitted.values["shape"])
+    es_r <- z_es_r/(1 - xi_r) + (beta_r - xi_r*tail_gpd$right$u)/(1 - xi_r)
+    es_l <- z_es_l/(1 - xi_l) + (beta_l - xi_l*tail_gpd$left$u)/(1 - xi_l)
+
+    out$Sigma[i]     <- sigma_f
+    out$VaR_Right[i] <- sigma_f * z_var_r
+    out$ES_Right[i]  <- sigma_f * es_r
+    out$VaR_Left[i]  <- -sigma_f * z_var_l
+    out$ES_Left[i]   <- -sigma_f * es_l
+    out$Actual[i]    <- as.numeric(returns[i + window_size])
+    out$Date[i]      <- index(returns)[i + window_size]
+
+    if (i %% 5 == 0 || i == n_forecasts) {
+      saveRDS(list(out = out, current_fit = current_fit, tail_gpd = tail_gpd, last_i = i),
+              file = checkpoint_file)
+    }
+  }
+  out
+}
+```
+
+### 10.1 Primary Run: u = 90%, Refit Every 20 Days
+
+```{r rolling-run-primary, eval=FALSE}
+rolling_results_primary <- list()
+
+for (m in names(z_wti)) {
+  cat("=== WTI:", m, "(primary, refit-20) ===\n")
+  rolling_results_primary[[paste0("WTI_", m)]] <- rolling_var_es_gen(
+    wti_ret, specs[[m]], refit_every = 20, q_thresh = 0.90,
+    label = paste("WTI", m), checkpoint_file = paste0("cp_wti_", m, "_r20.rds"))
+}
+for (m in names(z_brent)) {
+  cat("=== Brent:", m, "(primary, refit-20) ===\n")
+  rolling_results_primary[[paste0("Brent_", m)]] <- rolling_var_es_gen(
+    brent_ret, specs[[m]], refit_every = 20, q_thresh = 0.90,
+    label = paste("Brent", m), checkpoint_file = paste0("cp_brent_", m, "_r20.rds"))
+}
+
+saveRDS(rolling_results_primary, "rolling_var_es_primary_u90_r20.rds")
+```
+
+### 10.2 Refit-5 Check (Run Once Here; Locks Refit-20 as Standard Elsewhere)
+
+```{r rolling-run-refit5, eval=FALSE}
+rolling_results_refit5 <- list()
+
+for (m in names(z_wti)) {
+  cat("=== WTI:", m, "(refit-5 check) ===\n")
+  rolling_results_refit5[[paste0("WTI_", m)]] <- rolling_var_es_gen(
+    wti_ret, specs[[m]], refit_every = 5, q_thresh = 0.90,
+    label = paste("WTI", m, "r5"), checkpoint_file = paste0("cp_wti_", m, "_r5.rds"))
+}
+for (m in names(z_brent)) {
+  cat("=== Brent:", m, "(refit-5 check) ===\n")
+  rolling_results_refit5[[paste0("Brent_", m)]] <- rolling_var_es_gen(
+    brent_ret, specs[[m]], refit_every = 5, q_thresh = 0.90,
+    label = paste("Brent", m, "r5"), checkpoint_file = paste0("cp_brent_", m, "_r5.rds"))
+}
+
+saveRDS(rolling_results_refit5, "rolling_var_es_refit5_check.rds")
+
+# Compare parameter stability / violation rates between refit-20 and refit-5
+compare_refit <- function(nm) {
+  p20 <- rolling_results_primary[[nm]]
+  p5  <- rolling_results_refit5[[nm]]
+  data.frame(
+    Combination = nm,
+    Refit20_ViolRate_L = round(100 * mean(p20$Actual < p20$VaR_Left), 3),
+    Refit5_ViolRate_L  = round(100 * mean(p5$Actual  < p5$VaR_Left), 3),
+    Refit20_ViolRate_R = round(100 * mean(p20$Actual > p20$VaR_Right), 3),
+    Refit5_ViolRate_R  = round(100 * mean(p5$Actual  > p5$VaR_Right), 3)
+  )
+}
+refit_comparison <- do.call(rbind, lapply(names(rolling_results_primary), compare_refit))
+refit_comparison
+```
+
+Conclusion: refit frequency (20 vs 5 days) does not materially change
+violation rates or parameter stability. Refit-20 is retained as the
+standard specification for all subsequent frameworks in this dissertation
+on this basis, rather than repeating this specific check per framework.
+
+## 11. VaR99/ES97.5 vs VaR99/ES99 Comparison (u=90%, Refit-20 Fixed)
+
+No threshold sweep is performed; the GPD threshold is fixed at the
+MRL-confirmed 90th percentile throughout. Two confidence pairings are
+compared at this fixed threshold: the primary Basel FRTB pairing
+(VaR99/ES97.5) and a stricter pairing (VaR99/ES99), to test whether the
+ES confidence level itself affects exceedance-residual calibration.
+
+```{r es-comparison-run, eval=FALSE}
+rolling_es99 <- list()
+
+for (m in names(z_wti)) {
+  cat("=== WTI:", m, "(ES99 comparison) ===\n")
+  rolling_es99[[paste0("WTI_", m)]] <- rolling_var_es_gen(
+    wti_ret, specs[[m]], refit_every = 20, q_thresh = 0.90, p_es = 0.99,
+    label = paste("WTI", m, "ES99"), checkpoint_file = paste0("cp_wti_", m, "_es99.rds"))
+}
+for (m in names(z_brent)) {
+  cat("=== Brent:", m, "(ES99 comparison) ===\n")
+  rolling_es99[[paste0("Brent_", m)]] <- rolling_var_es_gen(
+    brent_ret, specs[[m]], refit_every = 20, q_thresh = 0.90, p_es = 0.99,
+    label = paste("Brent", m, "ES99"), checkpoint_file = paste0("cp_brent_", m, "_es99.rds"))
+}
+
+saveRDS(rolling_es99, "rolling_var_es_es99_comparison.rds")
+```
+
+```{r es-comparison-backtest, eval=FALSE}
+es_comparison_table <- rbind(
+  cbind(ES_level = "97.5%", run_all_backtests(rolling_results_primary)),
+  cbind(ES_level = "99%",   run_all_backtests(rolling_es99))
+)
+es_comparison_table
+write.csv(es_comparison_table, "shortmemory_es_comparison.csv", row.names = FALSE)
+```
+
+## 12. Backtest Functions
+
+```{r backtest-functions}
+kupiec_test <- function(violations, n, p = 0.01) {
+  x <- violations
+  pi_hat <- x / n
+  if (pi_hat == 0 || pi_hat == 1) return(data.frame(Violations = x, N = n,
+                                                     Observed_Rate = round(pi_hat*100,3),
+                                                     Nominal_Rate = p*100, LR_stat = NA, p_value = NA))
+  LR <- -2 * ((n - x) * log(1 - p) + x * log(p) -
+              ((n - x) * log(1 - pi_hat) + x * log(pi_hat)))
+  data.frame(Violations = x, N = n, Observed_Rate = round(pi_hat * 100, 3),
+             Nominal_Rate = p * 100, LR_stat = round(LR, 4), p_value = round(1 - pchisq(LR, df = 1), 4))
+}
+
+christoffersen_test <- function(violation_indicator) {
+  I <- violation_indicator; n <- length(I)
+  n00 <- sum(I[-n] == 0 & I[-1] == 0); n01 <- sum(I[-n] == 0 & I[-1] == 1)
+  n10 <- sum(I[-n] == 1 & I[-1] == 0); n11 <- sum(I[-n] == 1 & I[-1] == 1)
+  pi_hat  <- (n01 + n11) / (n00 + n01 + n10 + n11)
+  pi0_hat <- if ((n00 + n01) > 0) n01 / (n00 + n01) else 0
+  pi1_hat <- if ((n10 + n11) > 0) n11 / (n10 + n11) else 0
+  ll_restricted <- (n00 + n10) * log(1 - pi_hat) + (n01 + n11) * log(pi_hat)
+  ll_unrestricted <- 0
+  if ((n00 + n01) > 0) ll_unrestricted <- ll_unrestricted + n00*log(1-pi0_hat) + n01*(if(pi0_hat>0) log(pi0_hat) else 0)
+  if ((n10 + n11) > 0) ll_unrestricted <- ll_unrestricted + n10*log(1-pi1_hat) + n11*(if(pi1_hat>0) log(pi1_hat) else 0)
+  LR_ind <- -2 * (ll_restricted - ll_unrestricted)
+  data.frame(n00=n00, n01=n01, n10=n10, n11=n11,
+             LR_independence = round(LR_ind, 4), p_independence = round(1 - pchisq(LR_ind, df = 1), 4))
+}
+
+# McNeil & Frey (2000) exceedance residual test via the esback package
+# (Bayer & Dimitriadis) -- seeded for reproducibility of the internal bootstrap.
+mcneil_frey_test <- function(actual, VaR, ES, tail = "left", seed = 42, B = 1000) {
+  set.seed(seed)
+  if (tail == "left") {
+    violated <- actual < VaR
+    r <- actual[violated]; q <- VaR[violated]; e <- ES[violated]
+  } else {
+    violated <- actual > VaR
+    r <- -actual[violated]; q <- -VaR[violated]; e <- -ES[violated]
+  }
+  n_viol <- sum(violated)
+  if (n_viol < 5) return(data.frame(N_violations = n_viol, p_twosided = NA, p_onesided = NA))
+
+  result <- tryCatch(esback::er_backtest(r = r, q = q, e = e, B = B), error = function(e) NULL)
+  if (is.null(result)) return(data.frame(N_violations = n_viol, p_twosided = NA, p_onesided = NA))
+
+  data.frame(N_violations = n_viol,
+             p_twosided = round(result$pvalue_twosided_simple, 4),
+             p_onesided = round(result$pvalue_onesided_simple, 4))
+}
+
+runs_test_check <- function(actual, VaR, tail = "left") {
+  violated <- if (tail == "left") as.integer(actual < VaR) else as.integer(actual > VaR)
+  result <- tryCatch(runs.test(as.factor(violated)), error = function(e) NULL)
+  if (is.null(result)) return(data.frame(N_violations = sum(violated), runs_stat = NA, p_value = NA))
+  data.frame(N_violations = sum(violated), runs_stat = round(unname(result$statistic), 4),
+             p_value = round(result$p.value, 4))
+}
+```
+
+## 13. Full Backtest Run (Primary Spec: u=90%, Refit-20, VaR99/ES97.5)
+
+```{r backtest-run-primary, eval=FALSE}
+run_all_backtests <- function(rolling_results) {
+  do.call(rbind, lapply(names(rolling_results), function(nm) {
+    df <- rolling_results[[nm]]
+    n <- nrow(df)
+
+    left_viol  <- sum(df$Actual < df$VaR_Left)
+    right_viol <- sum(df$Actual > df$VaR_Right)
+
+    kup_l <- kupiec_test(left_viol, n, p = 0.01)
+    kup_r <- kupiec_test(right_viol, n, p = 0.01)
+    chr_l <- christoffersen_test(as.integer(df$Actual < df$VaR_Left))
+    chr_r <- christoffersen_test(as.integer(df$Actual > df$VaR_Right))
+    mf_l  <- mcneil_frey_test(df$Actual, df$VaR_Left,  df$ES_Left,  tail = "left")
+    mf_r  <- mcneil_frey_test(df$Actual, df$VaR_Right, df$ES_Right, tail = "right")
+    run_l <- runs_test_check(df$Actual, df$VaR_Left,  tail = "left")
+    run_r <- runs_test_check(df$Actual, df$VaR_Right, tail = "right")
+
+    rbind(
+      data.frame(Combination = nm, Tail = "Left",
+                Kupiec_p = kup_l$p_value, Christoffersen_p = chr_l$p_independence,
+                McNeilFrey_p_2sided = mf_l$p_twosided, Runs_p = run_l$p_value),
+      data.frame(Combination = nm, Tail = "Right",
+                Kupiec_p = kup_r$p_value, Christoffersen_p = chr_r$p_independence,
+                McNeilFrey_p_2sided = mf_r$p_twosided, Runs_p = run_r$p_value)
+    )
+  }))
+}
+
+backtest_table_primary <- run_all_backtests(rolling_results_primary)
+backtest_table_primary
+write.csv(backtest_table_primary, "shortmemory_backtest_primary.csv", row.names = FALSE)
+```
+
+## 14. Out-of-Sample Forecast Accuracy (MSE, MAE, QLIKE)
+
+Computed on the primary (u=90%, refit-20) rolling output -- distinct from
+Section 5.4's in-sample check -- for the later cross-framework comparison.
+
+```{r oos-forecast-accuracy, eval=FALSE}
+oos_accuracy <- function(roll, label) {
+  realized_var <- roll$Actual^2
+  forecast_var <- roll$Sigma^2
+  data.frame(Model = label,
+             MSE  = round(mean((realized_var - forecast_var)^2, na.rm = TRUE), 4),
+             MAE  = round(mean(abs(realized_var - forecast_var), na.rm = TRUE), 4),
+             QLIKE = round(mean(log(forecast_var) + realized_var / forecast_var, na.rm = TRUE), 4))
+}
+
+oos_accuracy_table <- do.call(rbind, lapply(names(rolling_results_primary), function(nm) {
+  oos_accuracy(rolling_results_primary[[nm]], nm)
+}))
+oos_accuracy_table
+write.csv(oos_accuracy_table, "shortmemory_oos_accuracy.csv", row.names = FALSE)
+```
+
+```{r save-final-outputs, eval=FALSE}
+saveRDS(list(
+  wti   = list(realized = shortmemory_final_output$rolling_results[["WTI_gjrGARCH_std"]]$Actual,
+               VaR_L    = shortmemory_final_output$rolling_results[["WTI_gjrGARCH_std"]]$VaR_Left,
+               VaR_R    = shortmemory_final_output$rolling_results[["WTI_gjrGARCH_std"]]$VaR_Right,
+               Date     = shortmemory_final_output$rolling_results[["WTI_gjrGARCH_std"]]$Date),
+  brent = list(realized = shortmemory_final_output$rolling_results[["Brent_gjrGARCH_std"]]$Actual,
+               VaR_L    = shortmemory_final_output$rolling_results[["Brent_gjrGARCH_std"]]$VaR_Left,
+               VaR_R    = shortmemory_final_output$rolling_results[["Brent_gjrGARCH_std"]]$VaR_Right,
+               Date     = shortmemory_final_output$rolling_results[["Brent_gjrGARCH_std"]]$Date)
+), file = "shortmemory_dm_input.rds")
+
+cat("Short-memory DM input saved.\n")
+```
+
+
+## 15. Save Final Outputs (Consistent Naming for Cross-Framework Comparison)
+
+```{r save-final-outputs, eval=FALSE}
+saveRDS(list(
+  rolling_results = rolling_results_primary,
+  gpd_table = gpd_results,
+  oos_accuracy = oos_accuracy_table,
+  backtest_primary = backtest_table_primary
+), file = "shortmemory_final_output.rds")
+
+cat("Short-memory master pipeline outputs saved.\n")
+```
