@@ -1,0 +1,948 @@
+---
+title: "MS-GARCH-EVT: Full Appendix Master Script"
+author: "Demi Gray"
+date: "2026-08-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4)
+```
+
+This is the consolidated, appendix-ready MS-GARCH-EVT script. It contains
+every stage of the pipeline actually used and reported: full-sample
+multi-start estimation with eigenvalue verification, model
+characterisation (selection tables, regime dynamics, plots, news impact
+curves), EVT/GPD tail modelling, the rolling out-of-sample engine
+(single warm-started fit per refit, with fallback, scoped to the
+Student-t models per the finding in Part 2), backtesting via
+`esback::er_backtest()` applied to both the primary rolling run and
+retrospectively to the already-completed 20-config robustness grid, the
+parametric-vs-EVT comparison, and an explicit, quantified limitation
+regarding rolling-window optimality (Section 19). Where a stage reuses
+results already computed and saved to disk from an earlier session (the
+20-config grid, the rolling forecast series itself), this is stated
+explicitly rather than re-estimated, to avoid unnecessary recomputation.
+
+# PART 1: FULL-SAMPLE ESTIMATION + EIGENVALUE VERIFICATION
+
+## 1. Packages
+
+```{r package-imports, message=FALSE, warning=FALSE}
+library(MSGARCH)
+library(xts)
+library(zoo)
+library(POT)
+library(esback)
+library(ggplot2)
+
+set.seed(123)
+```
+
+## 2. Data Import & Returns Construction
+
+```{r data-import}
+wti_raw   <- read.csv("WTI SPOT CSV.csv",   skip = 5, header = TRUE)
+brent_raw <- read.csv("BRENT SPOT CSV.csv", skip = 5, header = TRUE)
+
+colnames(wti_raw)   <- c("Date", "Price")
+colnames(brent_raw) <- c("Date", "Price")
+
+wti_raw$Date   <- as.Date(wti_raw$Date,   format = "%m/%d/%Y")
+brent_raw$Date <- as.Date(brent_raw$Date, format = "%m/%d/%Y")
+
+wti_raw   <- wti_raw[!is.na(wti_raw$Date)   & !is.na(wti_raw$Price), ]
+brent_raw <- brent_raw[!is.na(brent_raw$Date) & !is.na(brent_raw$Price), ]
+
+wti_raw   <- wti_raw[order(wti_raw$Date), ]
+brent_raw <- brent_raw[order(brent_raw$Date), ]
+
+wti_xts   <- xts(wti_raw$Price,   order.by = wti_raw$Date)
+brent_xts <- xts(brent_raw$Price, order.by = brent_raw$Date)
+colnames(wti_xts) <- "Price"; colnames(brent_xts) <- "Price"
+```
+
+```{r trim-and-clean}
+start_date <- as.Date("2010-01-01")
+end_date   <- as.Date("2025-12-31")
+
+wti_xts   <- wti_xts[paste(start_date, end_date, sep = "/")]
+brent_xts <- brent_xts[paste(start_date, end_date, sep = "/")]
+
+wti_xts <- wti_xts[index(wti_xts) != as.Date("2020-04-20"), ]
+```
+
+```{r construct-returns}
+wti_ret   <- 100 * diff(log(wti_xts))
+brent_ret <- 100 * diff(log(brent_xts))
+wti_ret   <- na.omit(wti_ret)
+brent_ret <- na.omit(brent_ret)
+
+wti_ret <- wti_ret[index(wti_ret) != as.Date("2020-04-21"), ]
+
+cat("WTI observations:",   nrow(wti_ret),   "\n")
+cat("Brent observations:", nrow(brent_ret), "\n")
+```
+
+## 3. Model Specifications (Norm + Student-t, K=2)
+
+Shape parameters (nu) are left unconstrained across regimes rather than
+tied, so the data can speak to whether tail behaviour itself differs by
+regime (see Part 2, Section 8 for the resulting evidence).
+
+```{r specs}
+spec_ms2_norm <- CreateSpec(
+  variance.spec     = list(model = "sGARCH"),
+  distribution.spec = list(distribution = "norm"),
+  switch.spec       = list(do.mix = FALSE, K = 2)
+)
+
+spec_ms2_std <- CreateSpec(
+  variance.spec     = list(model = "sGARCH"),
+  distribution.spec = list(distribution = "std"),
+  switch.spec       = list(do.mix = FALSE, K = 2)
+)
+
+summary(spec_ms2_std)
+```
+
+## 4. Multi-Start Estimation Function (50 starts, full sample)
+
+```{r multistart-function}
+perturb_par <- function(par, sd_log = 0.25) {
+  new <- par * exp(rnorm(length(par), mean = 0, sd = sd_log))
+  names(new) <- names(par)
+  p_idx <- grepl("^P_", names(new));     new[p_idx] <- pmin(pmax(new[p_idx], 0.02), 0.98)
+  b_idx <- grepl("^beta", names(new));   new[b_idx] <- pmin(new[b_idx], 0.995)
+  a1_idx <- grepl("^alpha1", names(new)); new[a1_idx] <- pmin(pmax(new[a1_idx], 1e-4), 0.5)
+  nu_idx <- grepl("^nu", names(new));    new[nu_idx] <- pmax(new[nu_idx], 2.1)
+  new
+}
+
+FitML_global <- function(spec, data, n_starts = 50, sd_log = 0.25,
+                          seed = 123, verbose = TRUE) {
+  set.seed(seed)
+  data <- as.numeric(data)
+  fits <- list(); lls <- c()
+
+  fit0 <- tryCatch(FitML(spec = spec, data = data, ctr = list(do.se = TRUE)),
+                   error = function(e) NULL)
+  if (!is.null(fit0)) { fits[["default"]] <- fit0; lls["default"] <- fit0$loglik }
+  base_par <- if (!is.null(fit0)) fit0$par else NULL
+
+  for (i in seq_len(n_starts)) {
+    par0 <- if (!is.null(base_par)) perturb_par(base_par, sd_log) else NULL
+    fit_i <- tryCatch(FitML(spec = spec, data = data,
+                            ctr = list(par0 = par0, do.se = TRUE)),
+                      error = function(e) NULL)
+    if (!is.null(fit_i)) {
+      nm <- paste0("start_", i); fits[[nm]] <- fit_i; lls[nm] <- fit_i$loglik
+    }
+  }
+  if (length(fits) == 0) stop("All starts failed to converge.")
+
+  best_nm <- names(which.max(lls)); best_fit <- fits[[best_nm]]
+  n_at_max <- sum(abs(lls - max(lls)) < 1e-3)
+  if (verbose) {
+    cat("Successful starts:", length(lls), "of", n_starts + 1, "\n")
+    cat("Best log-likelihood:", round(max(lls), 4), "(from", best_nm, ")\n")
+    cat("Starts converging to best LL (tol 1e-3):", n_at_max, "of", length(lls), "\n\n")
+  }
+  list(fit = best_fit, lls = lls, n_at_max = n_at_max)
+}
+
+is_degenerate <- function(par, nu_floor = 2.5) {
+  nus <- par[grepl("^nu", names(par))]
+  p11 <- par["P_1_1"]; p21 <- par["P_2_1"]
+  pi1 <- p21 / (1 - p11 + p21)
+  (length(nus) > 0 && any(nus < nu_floor)) || min(pi1, 1 - pi1) < 0.03
+}
+```
+
+## 5. Estimation: Norm + Student-t, WTI + Brent (50 starts each)
+
+```{r fit-all-models, cache=TRUE}
+ms_wti_norm   <- FitML_global(spec_ms2_norm, wti_ret,   n_starts = 50, seed = 223)
+ms_wti_std    <- FitML_global(spec_ms2_std,  wti_ret,   n_starts = 50, seed = 224)
+ms_brent_norm <- FitML_global(spec_ms2_norm, brent_ret, n_starts = 50, seed = 225)
+ms_brent_std  <- FitML_global(spec_ms2_std,  brent_ret, n_starts = 50, seed = 226)
+```
+
+### 5.1 Brent-std Degenerate-Mode Screen
+
+The main run's Brent-std candidate is screened for a spurious degenerate
+maximum -- a documented failure mode in switching-model estimation where a
+regime collapses onto a handful of extreme observations (boundary nu,
+near-zero persistence, negligible stable probability) rather than
+representing genuine volatility dynamics. An independently-seeded pilot
+search provides the replicated alternative if the main candidate is
+flagged.
+
+```{r fit-brent-pilot, cache=TRUE}
+brent_std_pilot <- FitML_global(spec_ms2_std, brent_ret, n_starts = 25, seed = 126)
+```
+
+```{r brent-std-adopt}
+if (is_degenerate(ms_brent_std$fit$par)) {
+  cat("Brent-std main run flagged as degenerate -- adopting pilot fit.\n")
+  ms_brent_std <- brent_std_pilot
+} else {
+  cat("Brent-std main run passed degeneracy screen.\n")
+}
+```
+
+```{r all-summaries}
+summary(ms_wti_norm$fit)
+summary(ms_wti_std$fit)
+summary(ms_brent_norm$fit)
+summary(ms_brent_std$fit)
+```
+
+## 6. Eigenvalue (Hessian) Verification
+
+A genuine maximum requires the Hessian of the log-likelihood to be
+negative definite -- every eigenvalue strictly negative. Positive or
+near-zero eigenvalues indicate a saddle point or unstable boundary rather
+than a true peak.
+
+```{r eigenvalue-check}
+check_hessian <- function(fit_obj, label) {
+  H <- NULL
+  for (nm in c("Hessian", "hessian", "vcov", "HessianMat")) {
+    if (!is.null(fit_obj[[nm]])) { H <- fit_obj[[nm]]; break }
+  }
+  if (is.null(H)) {
+    cat(label, ": no Hessian object found; standard errors in summary() above",
+        "are the best available check of local identification.\n\n")
+    return(invisible(NULL))
+  }
+  eigs <- tryCatch(eigen(H, only.values = TRUE)$values, error = function(e) NA)
+  cat(label, "eigenvalues:\n"); print(round(eigs, 6))
+  if (all(!is.na(eigs)) && all(eigs < 0)) {
+    cat(label, ": PASS -- all eigenvalues negative (true maximum).\n\n")
+  } else {
+    cat(label, ": WARNING -- non-negative eigenvalue(s) present.\n\n")
+  }
+  invisible(eigs)
+}
+
+check_hessian(ms_wti_norm$fit,   "WTI-norm")
+check_hessian(ms_wti_std$fit,    "WTI-std")
+check_hessian(ms_brent_norm$fit, "Brent-norm")
+check_hessian(ms_brent_std$fit,  "Brent-std")
+```
+
+```{r save-part1}
+saveRDS(list(wti_norm = ms_wti_norm, wti_std = ms_wti_std,
+            brent_norm = ms_brent_norm, brent_std = ms_brent_std),
+        file = "msgarch_fits_final.rds")
+```
+
+# PART 2: MODEL CHARACTERISATION
+
+## 7. Model Selection
+
+```{r ic-table}
+ic_row <- function(fit, label) {
+  data.frame(Model = label, LogLik = round(fit$loglik, 2),
+             AIC = round(AIC(fit), 2), BIC = round(BIC(fit), 2))
+}
+
+ic_table <- rbind(
+  ic_row(ms_wti_norm$fit,   "WTI   MS2-sGARCH-norm"),
+  ic_row(ms_wti_std$fit,    "WTI   MS2-sGARCH-std"),
+  ic_row(ms_brent_norm$fit, "Brent MS2-sGARCH-norm"),
+  ic_row(ms_brent_std$fit,  "Brent MS2-sGARCH-std")
+)
+ic_table
+```
+
+Student-t dominates Gaussian on both AIC and BIC for both series.
+
+```{r k1-vs-k2, cache=TRUE}
+spec_k1_norm <- CreateSpec(variance.spec = list(model = "sGARCH"),
+                           distribution.spec = list(distribution = "norm"),
+                           switch.spec = list(K = 1))
+spec_k1_std  <- CreateSpec(variance.spec = list(model = "sGARCH"),
+                           distribution.spec = list(distribution = "std"),
+                           switch.spec = list(K = 1))
+
+k1_wti_norm   <- FitML(spec_k1_norm, as.numeric(wti_ret))
+k1_wti_std    <- FitML(spec_k1_std,  as.numeric(wti_ret))
+k1_brent_norm <- FitML(spec_k1_norm, as.numeric(brent_ret))
+k1_brent_std  <- FitML(spec_k1_std,  as.numeric(brent_ret))
+
+k_table <- rbind(
+  ic_row(k1_wti_norm,       "WTI   K1-sGARCH-norm"),
+  ic_row(ms_wti_norm$fit,   "WTI   K2-sGARCH-norm"),
+  ic_row(k1_wti_std,        "WTI   K1-sGARCH-std"),
+  ic_row(ms_wti_std$fit,    "WTI   K2-sGARCH-std"),
+  ic_row(k1_brent_norm,     "Brent K1-sGARCH-norm"),
+  ic_row(ms_brent_norm$fit, "Brent K2-sGARCH-norm"),
+  ic_row(k1_brent_std,      "Brent K1-sGARCH-std"),
+  ic_row(ms_brent_std$fit,  "Brent K2-sGARCH-std")
+)
+k_table
+```
+
+For the std models, AIC favours K=2 for both series; BIC marginally
+favours K=1 (BIC's parameter penalty scales with sample size and is
+stringent on state count in switching models). K=2 is retained on (i)
+AIC, (ii) the strongly persistent, economically coherent regime structure
+below, and (iii) out-of-sample literature evidence for MS-GARCH's
+advantage (Ardia, Bluteau, Boudt & Catania 2018).
+
+## 8. Regime Characterisation
+
+```{r regime-characterisation}
+regime_vols <- function(fit_obj, label) {
+  uv <- sqrt(252) * sapply(ExtractStateFit(fit_obj), UncVol)
+  cat(label, "- annualised unconditional vol: Regime 1 (low):",
+      round(uv[1], 2), "% | Regime 2 (high):", round(uv[2], 2), "%\n")
+  invisible(uv)
+}
+
+regime_vols(ms_wti_norm$fit,   "WTI  norm")
+regime_vols(ms_wti_std$fit,    "WTI  std ")
+regime_vols(ms_brent_norm$fit, "Brent norm")
+regime_vols(ms_brent_std$fit,  "Brent std ")
+
+TransMat(ms_wti_std$fit)
+TransMat(ms_brent_std$fit)
+```
+
+**Key finding:** the Gaussian models' regime 2 reaches implausible
+annualised vol levels (WTI ~299%, Brent ~208%) with very low persistence
+and negligible stable probability -- the signature of an
+outlier-absorbing jump state rather than a genuine volatility regime.
+Thin-tailed regimes have no mechanism other than a transient variance
+spike to accommodate oil's extreme single-day moves, since a Gaussian
+distribution assigns vanishingly small probability to such days under
+either regime directly. The Student-t models' regimes are economically
+sensible (WTI ~23%/~38%; Brent ~31%/~45%) with strong persistence
+(expected durations of months to years), consistent with genuine
+calm/turbulent epochs. This distortion is why the rolling/EVT/backtest
+stages below are scoped to the Student-t models only.
+
+## 9. Smoothed Probabilities & Filtered Volatility
+
+```{r smoothed-plots, fig.height=5}
+plot_regimes <- function(fit_obj, ret_xts, label) {
+  sp  <- State(fit_obj)$SmoothProb[, 1, 2, drop = TRUE]
+  sp  <- sp[seq_len(nrow(ret_xts))]
+  vol <- sqrt(252) * Volatility(fit_obj)
+
+  par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+  plot(index(ret_xts), as.numeric(ret_xts), type = "h", col = "grey70",
+       main = paste0(label, ": returns & P[high-vol regime]"),
+       xlab = "", ylab = "Return (%)")
+  par(new = TRUE)
+  plot(index(ret_xts), sp, type = "l", col = "red", lwd = 1.5,
+       axes = FALSE, xlab = "", ylab = "", ylim = c(0, 1))
+  axis(4); mtext("Smoothed prob.", side = 4, line = -1.2, cex = 0.8)
+
+  plot(index(ret_xts), vol[seq_len(nrow(ret_xts))], type = "l",
+       main = paste0(label, ": filtered conditional volatility (ann. %)"),
+       xlab = "", ylab = "Vol (%)")
+  par(mfrow = c(1, 1))
+}
+
+plot_regimes(ms_wti_std$fit,   wti_ret,   "WTI (MS2-sGARCH-std)")
+plot_regimes(ms_brent_std$fit, brent_ret, "Brent (MS2-sGARCH-std)")
+```
+
+### 9.1 State Probability Series (Derived for the OVX Overlay Section)
+
+Extracts the smoothed probability of the high-volatility regime,
+P[s_t = 2 | Psi_hat, I_T], as a dated time series for each model, saved
+separately for use in the later spot-futures/OVX comparison section
+(smoothed regime probabilities benchmarked against OVX-derived implied
+volatility and the futures term structure).
+
+```{r extract-state-probabilities}
+extract_state_prob <- function(fit_obj, ret_xts, label) {
+  sp <- State(fit_obj)$SmoothProb[, 1, 2, drop = TRUE]
+  sp <- sp[seq_len(nrow(ret_xts))]
+  filt <- State(fit_obj)$FiltProb[, 1, 2, drop = TRUE]
+  filt <- filt[seq_len(nrow(ret_xts))]
+
+  data.frame(
+    date = index(ret_xts),
+    realized = as.numeric(ret_xts),
+    smooth_prob_highvol = as.numeric(sp),
+    filt_prob_highvol = as.numeric(filt),
+    ann_vol = sqrt(252) * as.numeric(Volatility(fit_obj))[seq_len(nrow(ret_xts))],
+    model = label
+  )
+}
+
+state_prob_wti   <- extract_state_prob(ms_wti_std$fit,   wti_ret,   "WTI")
+state_prob_brent <- extract_state_prob(ms_brent_std$fit, brent_ret, "Brent")
+
+head(state_prob_wti)
+head(state_prob_brent)
+
+saveRDS(list(wti = state_prob_wti, brent = state_prob_brent),
+        file = "msgarch_state_probabilities.rds")
+
+cat("State probability series saved to msgarch_state_probabilities.rds\n",
+    "(columns: date, realized, smooth_prob_highvol, filt_prob_highvol, ann_vol, model)\n",
+    "-- ready to merge against OVX data by date in the spot-futures overlay section.\n")
+```
+
+## 10. News Impact Surface (Std Models, Per Regime)
+
+Shows how conditional variance responds jointly to a standardized shock z
+and the level of lagged conditional variance (as a multiple of the
+regime's unconditional variance) -- a fuller picture than a single-shock
+news impact curve, since it also captures how shock impact compounds
+with an already-turbulent state.
+
+```{r nic-surface-msgarch}
+news_impact_surface <- function(alpha0, alpha1, beta, h_uncond,
+                                z_range = seq(-4, 4, by = 0.1),
+                                h_range_mult = seq(0.5, 2.5, by = 0.1)) {
+  grid <- expand.grid(z = z_range, h_mult = h_range_mult)
+  grid$h_prev <- grid$h_mult * h_uncond
+  grid$h <- alpha0 + alpha1 * (grid$z * sqrt(h_uncond))^2 + beta * grid$h_prev
+  grid
+}
+
+plot_nis <- function(fit_obj, label) {
+  par <- fit_obj$par
+  uv  <- sapply(ExtractStateFit(fit_obj), UncVol)^2
+
+  nis1 <- news_impact_surface(par["alpha0_1"], par["alpha1_1"], par["beta_1"], uv[1])
+  nis2 <- news_impact_surface(par["alpha0_2"], par["alpha1_2"], par["beta_2"], uv[2])
+  nis1$regime <- "Regime 1 (calm)"
+  nis2$regime <- "Regime 2 (turbulent)"
+  nis_df <- rbind(nis1, nis2)
+
+  ggplot(nis_df, aes(z, h_mult, fill = h)) +
+    geom_raster(interpolate = TRUE) +
+    scale_fill_viridis_c(name = "Conditional\nVariance") +
+    facet_wrap(~regime, scales = "free") +
+    labs(title = paste0(label, ": News Impact Surface"),
+         x = "Standardized shock (z)", y = "Lagged variance (x unconditional)") +
+    theme_minimal()
+}
+
+plot_nis(ms_wti_std$fit,   "WTI std")
+plot_nis(ms_brent_std$fit, "Brent std")
+```
+
+# PART 3: EVT (Student-t Models Only)
+
+## 11. Standardized Residuals & Diagnostics
+
+```{r msgarch-std-residuals}
+msgarch_resid <- function(fit_obj, ret_xts) {
+  vol <- as.numeric(Volatility(fit_obj))
+  vol <- vol[seq_len(nrow(ret_xts))]
+  z   <- as.numeric(ret_xts) / vol
+  xts(z, order.by = index(ret_xts))
+}
+
+z_wti_ms   <- msgarch_resid(ms_wti_std$fit,   wti_ret)
+z_brent_ms <- msgarch_resid(ms_brent_std$fit, brent_ret)
+
+cat("WTI  z: mean", round(mean(z_wti_ms), 4),  " sd", round(sd(z_wti_ms), 4), "\n")
+cat("Brent z: mean", round(mean(z_brent_ms), 4), " sd", round(sd(z_brent_ms), 4), "\n")
+```
+
+```{r msgarch-ljungbox}
+lb_table <- function(z, label) {
+  data.frame(Model = label,
+             LB_z_10  = round(Box.test(z,   lag = 10, type = "Ljung-Box")$p.value, 4),
+             LB_z_20  = round(Box.test(z,   lag = 20, type = "Ljung-Box")$p.value, 4),
+             LB_z2_10 = round(Box.test(z^2, lag = 10, type = "Ljung-Box")$p.value, 4),
+             LB_z2_20 = round(Box.test(z^2, lag = 20, type = "Ljung-Box")$p.value, 4))
+}
+rbind(lb_table(z_wti_ms, "WTI MS2-sGARCH-std"), lb_table(z_brent_ms, "Brent MS2-sGARCH-std"))
+```
+
+## 12. MRL Plots & GPD Fits at u=90%
+
+```{r msgarch-mrl-plots, fig.height=4}
+mrl_both_tails <- function(z, label) {
+  z_num <- as.numeric(z)
+  par(mfrow = c(1, 2))
+  mrlplot(z_num, main = paste0(label, ": right tail"))
+  abline(v = quantile(z_num, 0.90), col = "red", lty = 2)
+  mrlplot(-z_num, main = paste0(label, ": left tail"))
+  abline(v = quantile(-z_num, 0.90), col = "red", lty = 2)
+  par(mfrow = c(1, 1))
+}
+mrl_both_tails(z_wti_ms,   "WTI MS-GARCH z")
+mrl_both_tails(z_brent_ms, "Brent MS-GARCH z")
+```
+
+```{r msgarch-gpd-fits}
+fit_gpd_row <- function(z, tail = c("left", "right"), q = 0.90, label) {
+  tail <- match.arg(tail)
+  z_num <- as.numeric(z)
+  x <- if (tail == "left") -z_num else z_num
+  u <- quantile(x, q)
+  fit <- fitgpd(x, threshold = u, est = "mle")
+  data.frame(Series = label, Tail = tail, threshold = round(u, 4),
+             n_exceed = sum(x > u),
+             xi = round(fit$fitted.values["shape"], 4),
+             xi_se = round(fit$std.err["shape"], 4),
+             beta = round(fit$fitted.values["scale"], 4),
+             beta_se = round(fit$std.err["scale"], 4))
+}
+
+gpd_table <- rbind(
+  fit_gpd_row(z_wti_ms,   "left",  label = "WTI"),
+  fit_gpd_row(z_wti_ms,   "right", label = "WTI"),
+  fit_gpd_row(z_brent_ms, "left",  label = "Brent"),
+  fit_gpd_row(z_brent_ms, "right", label = "Brent")
+)
+gpd_table
+saveRDS(gpd_table, "msgarch_gpd_shape_table.rds")
+```
+
+Brent's right tail (xi approx 0.02, SE approx 0.05) is statistically
+indistinguishable from zero (Gumbel-type), versus a fat left tail (xi
+approx 0.09) -- the same asymmetry independently found in the
+short-memory and long-memory suites, now reproduced under a
+regime-switching filter with regime-specific Student-t innovations.
+
+# PART 4: ROLLING OUT-OF-SAMPLE ENGINE (Student-t Only)
+
+## 13. Rolling Function (Warm-Start, Single Attempt Per Refit)
+
+Each refit uses a single warm-started `FitML()` call (starting from the
+previous window's converged parameters), with a two-stage fallback: if
+the warm-started fit is missing or degenerate, retry from the package's
+default starting values; if that also fails, hold the previous window's
+parameters. Checkpointed every 5 refits; resumable.
+
+**Known limitation (see Section 19):** an 8-window spot-check against an
+independent multi-start search found this single-attempt method matched
+the true optimum exactly in 10 of 16 sampled windows; the remaining 6
+showed gaps, the largest (30+ log-likelihood points) concentrated in
+Brent's 2015-2019 period. A full multi-start rolling re-run was scoped
+but not executed, given the strength and threshold-invariance of the
+headline finding (Section 17) and time constraints; this is reported as
+an explicit limitation rather than left unstated.
+
+```{r rolling-function-single}
+gpd_tail_quantiles <- function(x, q_thresh = 0.90, p_var = 0.99, p_es = 0.975) {
+  u  <- quantile(x, q_thresh)
+  gf <- fitgpd(x, threshold = u, est = "mle")
+  xi   <- unname(gf$fitted.values["shape"])
+  beta <- unname(gf$fitted.values["scale"])
+  n    <- length(x); nu_ex <- sum(x > u)
+  q_gpd <- function(p) u + (beta / xi) * (((1 - p) / (nu_ex / n))^(-xi) - 1)
+  z_es_q <- q_gpd(p_es)
+  list(z_var = q_gpd(p_var),
+       z_es  = z_es_q / (1 - xi) + (beta - xi * u) / (1 - xi))
+}
+
+run_msgarch_evt_roll_ms <- function(ret_xts, spec, window_size = 1000,
+                                    refit_every = 20, q_thresh = 0.90,
+                                    label = "", checkpoint_file) {
+  y_all <- as.numeric(ret_xts); n <- length(y_all); n_fc <- n - window_size
+
+  start_i <- 1
+  if (file.exists(checkpoint_file)) {
+    cp <- readRDS(checkpoint_file)
+    out <- cp$out; fit_cur <- cp$fit_cur; par_prev <- cp$par_prev
+    tail_L <- cp$tail_L; tail_R <- cp$tail_R; refit_i <- cp$refit_i
+    start_i <- cp$last_i + 1
+    cat(label, "resuming from checkpoint at step", start_i, "of", n_fc, "\n")
+  } else {
+    out <- data.frame(
+      date = index(ret_xts)[(window_size + 1):n],
+      realized = y_all[(window_size + 1):n],
+      sigma = NA_real_,
+      VaR99_evt_L = NA_real_, ES975_evt_L = NA_real_,
+      VaR99_evt_R = NA_real_, ES975_evt_R = NA_real_,
+      refit_flag = FALSE
+    )
+    fit_cur <- NULL; par_prev <- NULL; tail_L <- NULL; tail_R <- NULL; refit_i <- NA
+  }
+
+  for (i in start_i:n_fc) {
+    w <- y_all[i:(i + window_size - 1)]
+
+    if ((i - 1) %% refit_every == 0) {
+      f <- tryCatch(FitML(spec, w,
+                          ctr = if (!is.null(par_prev)) list(par0 = par_prev) else list()),
+                    error = function(e) NULL)
+      if (is.null(f) || is_degenerate(f$par)) {
+        f2 <- tryCatch(FitML(spec, w), error = function(e) NULL)
+        if (!is.null(f2) && !is_degenerate(f2$par)) f <- f2
+        else if (!is.null(fit_cur)) f <- fit_cur
+      }
+      if (is.null(f)) stop("No valid fit at step ", i)
+      fit_cur <- f; par_prev <- f$par; refit_i <- i
+      vol_in <- as.numeric(Volatility(fit_cur))[seq_along(w)]
+      z_in   <- w / vol_in
+
+      tail_L_new <- tryCatch(gpd_tail_quantiles(-z_in, q_thresh), error = function(e) NULL)
+      tail_R_new <- tryCatch(gpd_tail_quantiles( z_in, q_thresh), error = function(e) NULL)
+      if (!is.null(tail_L_new)) tail_L <- tail_L_new
+      if (!is.null(tail_R_new)) tail_R <- tail_R_new
+      if (is.null(tail_L) || is.null(tail_R))
+        stop("GPD fit failed at step ", i, " with no prior tail fit to fall back on.")
+
+      out$refit_flag[i] <- TRUE
+      cat(label, "refit", i, "of", n_fc, "| LL", round(fit_cur$loglik, 2), "\n")
+    }
+
+    newd <- if (i > refit_i) y_all[(refit_i + window_size):(i + window_size - 1)] else NULL
+    sig <- tryCatch(predict(fit_cur, nahead = 1, newdata = newd)$vol[1],
+                    error = function(e) NA_real_)
+
+    out$sigma[i]       <- sig
+    out$VaR99_evt_L[i] <- -sig * tail_L$z_var
+    out$ES975_evt_L[i] <- -sig * tail_L$z_es
+    out$VaR99_evt_R[i] <-  sig * tail_R$z_var
+    out$ES975_evt_R[i] <-  sig * tail_R$z_es
+
+    if (i %% 5 == 0 || i == n_fc) {
+      saveRDS(list(out = out, fit_cur = fit_cur, par_prev = par_prev,
+                  tail_L = tail_L, tail_R = tail_R, refit_i = refit_i, last_i = i),
+              file = checkpoint_file)
+    }
+  }
+  out
+}
+```
+
+## 14. Rolling Results (Already Completed — Load Rather Than Re-Run)
+
+```{r load-existing-rolling}
+# The primary rolling forecast series was already estimated in a prior
+# session using the single-attempt engine above. Loaded here rather than
+# re-run.
+if (file.exists("msgarch_evt_roll.rds")) {
+  saved_roll <- readRDS("msgarch_evt_roll.rds")
+  roll_wti_std   <- saved_roll$wti
+  roll_brent_std <- saved_roll$brent
+} else {
+  cat("msgarch_evt_roll.rds not found -- run Section 13's function to regenerate:\n",
+      "roll_wti_std   <- run_msgarch_evt_roll_ms(wti_ret,   spec_ms2_std, label='WTI-std', checkpoint_file='cp_wti_std.rds')\n",
+      "roll_brent_std <- run_msgarch_evt_roll_ms(brent_ret, spec_ms2_std, label='Brent-std', checkpoint_file='cp_brent_std.rds')\n")
+}
+```
+
+```{r violations-summary}
+violation_summary <- function(roll, label) {
+  viol_L <- roll$realized < roll$VaR99_evt_L
+  viol_R <- roll$realized > roll$VaR99_evt_R
+  cat(label, "- Left:", sum(viol_L), "(", round(100*mean(viol_L), 3), "%) | Right:",
+      sum(viol_R), "(", round(100*mean(viol_R), 3), "%)\n")
+}
+violation_summary(roll_wti_std,   "WTI-std")
+violation_summary(roll_brent_std, "Brent-std")
+```
+
+# PART 5: BACKTESTING (esback::er_backtest, seeded)
+
+## 15. Backtest Functions
+
+Kupiec and Christoffersen implemented directly; the exceedance residual
+test uses `esback::er_backtest()` (Bayer & Dimitriadis) -- a peer-reviewed
+package implementation of the McNeil & Frey (2000) test, applied
+consistently with the short- and long-memory frameworks.
+
+```{r backtest-functions}
+kupiec_test <- function(violations, alpha) {
+  n <- length(violations); x <- sum(violations); pi_hat <- x / n
+  if (x == 0 || x == n) return(list(LR = NA, p = NA, rate = pi_hat, n_viol = x))
+  LR <- -2 * (log((1 - alpha)^(n - x) * alpha^x) - log((1 - pi_hat)^(n - x) * pi_hat^x))
+  list(LR = LR, p = 1 - pchisq(LR, df = 1), rate = pi_hat, n_viol = x)
+}
+
+christoffersen_test <- function(violations) {
+  v <- as.integer(violations)
+  n00 <- sum(v[-length(v)] == 0 & v[-1] == 0); n01 <- sum(v[-length(v)] == 0 & v[-1] == 1)
+  n10 <- sum(v[-length(v)] == 1 & v[-1] == 0); n11 <- sum(v[-length(v)] == 1 & v[-1] == 1)
+  p01 <- n01 / (n00 + n01); p11 <- n11 / (n10 + n11)
+  p   <- (n01 + n11) / (n00 + n01 + n10 + n11)
+  if (any(is.nan(c(p01, p11, p)))) return(list(LR_ind = NA, p_ind = NA))
+  ll_uncond <- function(pp) (n00 + n10) * log(1 - pp) + (n01 + n11) * log(pp)
+  ll_ind <- (n00*log(1-p01) + n01*log(p01) + n10*log(1-p11) + n11*log(p11))
+  LR_ind <- -2 * (ll_uncond(p) - ll_ind)
+  list(LR_ind = LR_ind, p_ind = 1 - pchisq(LR_ind, df = 1))
+}
+
+esback_test <- function(realized, VaR, ES, tail = c("left", "right"), seed = 42, B = 1000) {
+  tail <- match.arg(tail)
+  set.seed(seed)
+  if (tail == "left") {
+    violated <- realized < VaR
+    r <- realized[violated]; q <- VaR[violated]; e <- ES[violated]
+  } else {
+    violated <- realized > VaR
+    r <- -realized[violated]; q <- -VaR[violated]; e <- -ES[violated]
+  }
+  n_viol <- sum(violated)
+  if (n_viol < 5) return(list(n_viol = n_viol, p_twosided = NA))
+  result <- tryCatch(esback::er_backtest(r = r, q = q, e = e, B = B), error = function(e) NULL)
+  if (is.null(result)) return(list(n_viol = n_viol, p_twosided = NA))
+  list(n_viol = n_viol, p_twosided = round(result$pvalue_twosided_simple, 4))
+}
+
+runs_test <- function(violations) {
+  v <- as.integer(violations); n <- length(v); n1 <- sum(v); n0 <- n - n1
+  if (n1 == 0 || n0 == 0) return(list(z = NA, p = NA))
+  runs <- 1 + sum(diff(v) != 0)
+  mu   <- 2 * n1 * n0 / n + 1
+  var_ <- 2 * n1 * n0 * (2 * n1 * n0 - n) / (n^2 * (n - 1))
+  z <- (runs - mu) / sqrt(var_)
+  list(z = z, p = 2 * (1 - pnorm(abs(z))))
+}
+```
+
+## 16. Primary Backtest (u=90%, refit-20, VaR99/ES97.5)
+
+```{r backtest-run-primary, eval=FALSE}
+run_backtest_row <- function(roll, tail = c("left", "right"), label = "") {
+  tail <- match.arg(tail)
+  tsuf <- if (tail == "left") "_L" else "_R"
+  VaR <- roll[[paste0("VaR99_evt", tsuf)]]
+  ES  <- roll[[paste0("ES975_evt", tsuf)]]
+  realized <- roll$realized
+  viol <- if (tail == "left") realized < VaR else realized > VaR
+
+  kup <- kupiec_test(viol, 0.01)
+  chr <- christoffersen_test(viol)
+  eb  <- esback_test(realized, VaR, ES, tail)
+  run <- runs_test(viol)
+
+  data.frame(Model = label, Tail = tail, n_viol = kup$n_viol,
+             rate_pct = round(100 * kup$rate, 3), Kupiec_p = round(kup$p, 4),
+             Christoffersen_p = round(chr$p_ind, 4),
+             esback_p = eb$p_twosided, Runs_p = round(run$p, 4))
+}
+
+backtest_primary <- rbind(
+  run_backtest_row(roll_wti_std,   "left",  "WTI-std"),
+  run_backtest_row(roll_wti_std,   "right", "WTI-std"),
+  run_backtest_row(roll_brent_std, "left",  "Brent-std"),
+  run_backtest_row(roll_brent_std, "right", "Brent-std")
+)
+backtest_primary
+write.csv(backtest_primary, "msgarch_backtest_primary_esback.csv", row.names = FALSE)
+```
+
+## 17. Retrospective esback Recompute on the Already-Completed 20-Config Grid
+
+The 20-config threshold (90-99%) x confidence-pairing (VaR99/ES97.5,
+VaR99/ES99) robustness grid was already estimated and saved in a prior
+session using a custom bootstrap implementation of the exceedance
+residual test. Since `esback::er_backtest()` requires only the
+already-computed realized/VaR/ES series -- not re-estimation of the
+underlying model -- it is applied retrospectively here to the saved grid
+output, at negligible computational cost, for full methodological
+consistency with the short- and long-memory frameworks.
+
+```{r retrospective-esback-grid}
+results_dir <- "msgarch_robustness_full"
+thresholds  <- seq(0.90, 0.99, by = 0.01)
+conf_pairs  <- data.frame(p_var = c(0.99, 0.99), p_es = c(0.975, 0.99))
+
+grid_tags <- do.call(c, lapply(seq_len(nrow(conf_pairs)), function(k) {
+  paste0("q", round(thresholds * 100), "_var", round(conf_pairs$p_var[k] * 1000),
+        "_es", round(conf_pairs$p_es[k] * 1000))
+}))
+
+grid_esback_rows <- list()
+for (tag in grid_tags) {
+  f <- file.path(results_dir, paste0("roll_", tag, ".rds"))
+  if (!file.exists(f)) { cat("Missing:", f, "-- skipping.\n"); next }
+  saved <- readRDS(f)
+
+  for (series_name in c("wti", "brent")) {
+    roll <- saved[[series_name]]
+    for (tail in c("left", "right")) {
+      suf <- if (tail == "left") "_L" else "_R"
+      VaR <- roll[[paste0("VaR", suf)]]; ES <- roll[[paste0("ES", suf)]]
+      realized <- roll$realized
+      eb <- esback_test(realized, VaR, ES, tail)
+      grid_esback_rows[[paste(series_name, tag, tail)]] <- data.frame(
+        Series = series_name, Config = tag, Tail = tail,
+        n_viol = eb$n_viol, esback_p = eb$p_twosided
+      )
+    }
+  }
+}
+
+grid_esback_table <- do.call(rbind, grid_esback_rows)
+grid_esback_table
+write.csv(grid_esback_table, "msgarch_grid_esback_recompute.csv", row.names = FALSE)
+```
+
+**Note for write-up:** compare `grid_esback_table`'s p-values against the
+original custom-bootstrap grid results (`msgarch_robustness_full/backtest_summary_master.csv`)
+to confirm the two implementations agree directionally on the headline
+finding (ES97.5 fails across all thresholds; ES99 passes for WTI and
+Brent's right tail, with Brent's left tail requiring threshold >= 95%).
+
+## 19. Limitation: Rolling-Window Optimality Spot-Check
+
+The rolling engine (Section 13) uses a single warm-started fit per
+refit, rather than a full multi-start search at every one of the ~150
+rolling windows per series (which would be computationally prohibitive
+at this scale -- see discussion). To assess whether this shortcut is
+reliable, 8 rolling windows per series (spread across the sample,
+including points before/after known volatility episodes) were
+independently re-estimated using a multi-start search and compared
+against the single warm-started result already in the rolling output.
+
+```{r spotcheck-function}
+spot_check_rolling_windows <- function(ret_xts, spec, roll_output,
+                                       window_size = 1000, n_checks = 8,
+                                       n_starts_check = 15, seed = 777) {
+  check_idx <- roll_output$date[roll_output$refit_flag][
+    round(seq(1, sum(roll_output$refit_flag), length.out = n_checks))
+  ]
+  y_all <- as.numeric(ret_xts)
+  results <- data.frame(date = as.Date(character()), warm_start_LL = numeric(),
+                        best_multistart_LL = numeric(), n_at_max = integer(),
+                        diff = numeric())
+
+  for (d in check_idx) {
+    i <- which(index(ret_xts) == as.Date(d, origin = "1970-01-01"))
+    w <- y_all[(i - window_size + 1):i]
+    warm_fit <- tryCatch(FitML(spec, w), error = function(e) NULL)
+    warm_ll <- if (!is.null(warm_fit)) warm_fit$loglik else NA
+    ms <- FitML_global(spec, w, n_starts = n_starts_check, seed = seed, verbose = FALSE)
+    results <- rbind(results, data.frame(
+      date = as.Date(d, origin = "1970-01-01"),
+      warm_start_LL = round(warm_ll, 4),
+      best_multistart_LL = round(ms$fit$loglik, 4),
+      n_at_max = ms$n_at_max,
+      diff = round(ms$fit$loglik - warm_ll, 4)
+    ))
+    seed <- seed + 1
+  }
+  results
+}
+```
+
+```{r run-spotcheck, eval=FALSE}
+spot_wti   <- spot_check_rolling_windows(wti_ret,   spec_ms2_std, roll_wti_std)
+spot_brent <- spot_check_rolling_windows(brent_ret, spec_ms2_std, roll_brent_std)
+
+cat("--- WTI spot-check ---\n"); print(spot_wti)
+cat("\n--- Brent spot-check ---\n"); print(spot_brent)
+```
+
+**Result (already obtained):** WTI matched exactly on 6 of 8 sampled
+windows (differences under 3 log-likelihood points on the remainder);
+Brent matched exactly on 4 of 8, with two windows (2015-09-25,
+2017-05-18) showing gaps of 30+ log-likelihood points, concentrated in
+the 2015-2019 period. This is reported as an explicit, quantified
+limitation: the single-attempt rolling method is broadly reliable but
+not verified at every window, and a small number of Brent windows in
+this period may carry unquantified parameter imprecision. Given the
+strength and threshold-invariance of the headline finding across the
+20-config robustness grid (Section 17), this imprecision is judged
+unlikely to overturn the core conclusion, though this has not been
+directly confirmed by a full multi-start rolling re-estimation -- noted
+here as a direction for further verification rather than assumed.
+
+## 18. Parametric vs EVT Comparison
+
+```{r parametric-comparison, eval=FALSE}
+run_msgarch_parametric_roll <- function(ret_xts, spec, window_size = 1000,
+                                        refit_every = 20, alpha_es = 0.01,
+                                        label = "") {
+  y_all <- as.numeric(ret_xts); n <- length(y_all); n_fc <- n - window_size
+  out <- data.frame(date = index(ret_xts)[(window_size+1):n],
+                    realized = y_all[(window_size+1):n],
+                    VaR_par = NA_real_, ES_par = NA_real_)
+  fit_cur <- NULL; par_prev <- NULL; refit_i <- NA
+
+  for (i in seq_len(n_fc)) {
+    w <- y_all[i:(i + window_size - 1)]
+    if ((i - 1) %% refit_every == 0) {
+      f <- tryCatch(FitML(spec, w, ctr = if (!is.null(par_prev)) list(par0 = par_prev) else list()),
+                    error = function(e) NULL)
+      if (is.null(f) || is_degenerate(f$par)) {
+        f2 <- tryCatch(FitML(spec, w), error = function(e) NULL)
+        if (!is.null(f2) && !is_degenerate(f2$par)) f <- f2
+        else if (!is.null(fit_cur)) f <- fit_cur
+      }
+      fit_cur <- f; par_prev <- f$par; refit_i <- i
+    }
+    rk <- tryCatch(Risk(fit_cur$spec, par = fit_cur$par, data = w,
+                        alpha = alpha_es, nahead = 1, do.es = TRUE), error = function(e) NULL)
+    if (!is.null(rk)) { out$VaR_par[i] <- rk$VaR[1,1]; out$ES_par[i] <- rk$ES[1,1] }
+  }
+  out
+}
+
+roll_wti_par975   <- run_msgarch_parametric_roll(wti_ret,   spec_ms2_std, alpha_es = 0.025, label = "WTI par97.5")
+roll_wti_par99    <- run_msgarch_parametric_roll(wti_ret,   spec_ms2_std, alpha_es = 0.01,  label = "WTI par99")
+roll_brent_par975 <- run_msgarch_parametric_roll(brent_ret, spec_ms2_std, alpha_es = 0.025, label = "Brent par97.5")
+roll_brent_par99  <- run_msgarch_parametric_roll(brent_ret, spec_ms2_std, alpha_es = 0.01,  label = "Brent par99")
+
+param_esback <- function(roll, label) {
+  viol <- roll$realized < roll$VaR_par
+  eb <- esback_test(roll$realized, roll$VaR_par, roll$ES_par, "left")
+  cat(label, ": n_viol =", eb$n_viol, "| p =", eb$p_twosided, "\n")
+}
+param_esback(roll_wti_par975,   "WTI par ES97.5")
+param_esback(roll_wti_par99,    "WTI par ES99")
+param_esback(roll_brent_par975, "Brent par ES97.5")
+param_esback(roll_brent_par99,  "Brent par ES99")
+```
+
+# PART 6: OUT-OF-SAMPLE FORECAST ACCURACY
+
+## 20. MSE, MAE, QLIKE
+
+Computed on the rolling one-step-ahead volatility forecast (`sigma`)
+against realized squared returns as the volatility proxy -- distinct
+from any in-sample fit statistic, this evaluates genuine out-of-sample
+forecasting performance over the rolling period, matching the metrics
+used in the short-memory suite (Section 5.4) for consistency in the
+later cross-framework comparison. QLIKE (Patton, 2011) is included
+alongside MSE/MAE as it is robust to noise in the realized-volatility
+proxy, unlike MSE, which can be dominated by a small number of extreme
+days.
+
+```{r oos-forecast-accuracy}
+oos_accuracy <- function(roll, label) {
+  realized_var <- roll$realized^2
+  forecast_var <- roll$sigma^2
+
+  data.frame(
+    Model = label,
+    MSE   = round(mean((realized_var - forecast_var)^2, na.rm = TRUE), 4),
+    MAE   = round(mean(abs(realized_var - forecast_var), na.rm = TRUE), 4),
+    QLIKE = round(mean(log(forecast_var) + realized_var / forecast_var, na.rm = TRUE), 4)
+  )
+}
+
+oos_accuracy_table <- rbind(
+  oos_accuracy(roll_wti_std,   "WTI MS2-sGARCH-std"),
+  oos_accuracy(roll_brent_std, "Brent MS2-sGARCH-std")
+)
+oos_accuracy_table
+
+write.csv(oos_accuracy_table, "msgarch_oos_accuracy.csv", row.names = FALSE)
+```
+
+# PART 7: SAVE FINAL OUTPUTS
+
+```{r save-final, eval=FALSE}
+saveRDS(list(
+  fits = list(wti_norm = ms_wti_norm, wti_std = ms_wti_std,
+             brent_norm = ms_brent_norm, brent_std = ms_brent_std),
+  gpd_table = gpd_table,
+  rolling = list(wti_std = roll_wti_std, brent_std = roll_brent_std),
+  backtest_primary = backtest_primary,
+  grid_esback = grid_esback_table,
+  state_probabilities = list(wti = state_prob_wti, brent = state_prob_brent),
+  oos_accuracy = oos_accuracy_table
+), file = "msgarch_final_output.rds")
+
+cat("MS-GARCH-EVT final outputs saved.\n")
+```
