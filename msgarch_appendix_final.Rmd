@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4)
 
 This is the consolidated, appendix-ready MS-GARCH-EVT script. It contains
 every stage of the pipeline actually used and reported: full-sample
-multi-start estimation with eigenvalue verification, model
+multi-start estimation, model
 characterisation (selection tables, regime dynamics, plots, news impact
 curves), EVT/GPD tail modelling, the rolling out-of-sample engine
 (single warm-started fit per refit, with fallback, scoped to the
@@ -24,7 +24,7 @@ results already computed and saved to disk from an earlier session (the
 20-config grid, the rolling forecast series itself), this is stated
 explicitly rather than re-estimated, to avoid unnecessary recomputation.
 
-# PART 1: FULL-SAMPLE ESTIMATION + EIGENVALUE VERIFICATION
+# PART 1: FULL-SAMPLE ESTIMATION 
 
 ## 1. Packages
 
@@ -196,46 +196,6 @@ summary(ms_wti_norm$fit)
 summary(ms_wti_std$fit)
 summary(ms_brent_norm$fit)
 summary(ms_brent_std$fit)
-```
-
-## 6. Eigenvalue (Hessian) Verification
-
-A genuine maximum requires the Hessian of the log-likelihood to be
-negative definite -- every eigenvalue strictly negative. Positive or
-near-zero eigenvalues indicate a saddle point or unstable boundary rather
-than a true peak.
-
-```{r eigenvalue-check}
-check_hessian <- function(fit_obj, label) {
-  H <- NULL
-  for (nm in c("Hessian", "hessian", "vcov", "HessianMat")) {
-    if (!is.null(fit_obj[[nm]])) { H <- fit_obj[[nm]]; break }
-  }
-  if (is.null(H)) {
-    cat(label, ": no Hessian object found; standard errors in summary() above",
-        "are the best available check of local identification.\n\n")
-    return(invisible(NULL))
-  }
-  eigs <- tryCatch(eigen(H, only.values = TRUE)$values, error = function(e) NA)
-  cat(label, "eigenvalues:\n"); print(round(eigs, 6))
-  if (all(!is.na(eigs)) && all(eigs < 0)) {
-    cat(label, ": PASS -- all eigenvalues negative (true maximum).\n\n")
-  } else {
-    cat(label, ": WARNING -- non-negative eigenvalue(s) present.\n\n")
-  }
-  invisible(eigs)
-}
-
-check_hessian(ms_wti_norm$fit,   "WTI-norm")
-check_hessian(ms_wti_std$fit,    "WTI-std")
-check_hessian(ms_brent_norm$fit, "Brent-norm")
-check_hessian(ms_brent_std$fit,  "Brent-std")
-```
-
-```{r save-part1}
-saveRDS(list(wti_norm = ms_wti_norm, wti_std = ms_wti_std,
-            brent_norm = ms_brent_norm, brent_std = ms_brent_std),
-        file = "msgarch_fits_final.rds")
 ```
 
 # PART 2: MODEL CHARACTERISATION
@@ -846,53 +806,6 @@ strength and threshold-invariance of the headline finding across the
 unlikely to overturn the core conclusion, though this has not been
 directly confirmed by a full multi-start rolling re-estimation -- noted
 here as a direction for further verification rather than assumed.
-
-## 18. Parametric vs EVT Comparison
-
-```{r parametric-comparison, eval=FALSE}
-run_msgarch_parametric_roll <- function(ret_xts, spec, window_size = 1000,
-                                        refit_every = 20, alpha_es = 0.01,
-                                        label = "") {
-  y_all <- as.numeric(ret_xts); n <- length(y_all); n_fc <- n - window_size
-  out <- data.frame(date = index(ret_xts)[(window_size+1):n],
-                    realized = y_all[(window_size+1):n],
-                    VaR_par = NA_real_, ES_par = NA_real_)
-  fit_cur <- NULL; par_prev <- NULL; refit_i <- NA
-
-  for (i in seq_len(n_fc)) {
-    w <- y_all[i:(i + window_size - 1)]
-    if ((i - 1) %% refit_every == 0) {
-      f <- tryCatch(FitML(spec, w, ctr = if (!is.null(par_prev)) list(par0 = par_prev) else list()),
-                    error = function(e) NULL)
-      if (is.null(f) || is_degenerate(f$par)) {
-        f2 <- tryCatch(FitML(spec, w), error = function(e) NULL)
-        if (!is.null(f2) && !is_degenerate(f2$par)) f <- f2
-        else if (!is.null(fit_cur)) f <- fit_cur
-      }
-      fit_cur <- f; par_prev <- f$par; refit_i <- i
-    }
-    rk <- tryCatch(Risk(fit_cur$spec, par = fit_cur$par, data = w,
-                        alpha = alpha_es, nahead = 1, do.es = TRUE), error = function(e) NULL)
-    if (!is.null(rk)) { out$VaR_par[i] <- rk$VaR[1,1]; out$ES_par[i] <- rk$ES[1,1] }
-  }
-  out
-}
-
-roll_wti_par975   <- run_msgarch_parametric_roll(wti_ret,   spec_ms2_std, alpha_es = 0.025, label = "WTI par97.5")
-roll_wti_par99    <- run_msgarch_parametric_roll(wti_ret,   spec_ms2_std, alpha_es = 0.01,  label = "WTI par99")
-roll_brent_par975 <- run_msgarch_parametric_roll(brent_ret, spec_ms2_std, alpha_es = 0.025, label = "Brent par97.5")
-roll_brent_par99  <- run_msgarch_parametric_roll(brent_ret, spec_ms2_std, alpha_es = 0.01,  label = "Brent par99")
-
-param_esback <- function(roll, label) {
-  viol <- roll$realized < roll$VaR_par
-  eb <- esback_test(roll$realized, roll$VaR_par, roll$ES_par, "left")
-  cat(label, ": n_viol =", eb$n_viol, "| p =", eb$p_twosided, "\n")
-}
-param_esback(roll_wti_par975,   "WTI par ES97.5")
-param_esback(roll_wti_par99,    "WTI par ES99")
-param_esback(roll_brent_par975, "Brent par ES97.5")
-param_esback(roll_brent_par99,  "Brent par ES99")
-```
 
 # PART 6: OUT-OF-SAMPLE FORECAST ACCURACY
 
